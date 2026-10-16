@@ -38,25 +38,33 @@ def sniff_content_type(file_name: str, declared: str | None, head: bytes) -> str
 
 
 def extract_content(path: Path, content_type: str) -> DocumentContent:
+    """Parse the stored file. Anything the parser rejects is a property of the
+    file and will fail identically on retry, so it is a PermanentError; only I/O
+    errors (OSError) stay retryable."""
     if content_type in PDF_TYPES:
         return _pdf(path)
     if content_type in XLSX_TYPES:
         return _xlsx(path)
     if content_type in TEXT_TYPES:
-        return DocumentContent(kind="text", pages=[PageText(page=1, text=path.read_text("utf-8"))])
+        try:
+            text = path.read_text("utf-8")
+        except UnicodeDecodeError as exc:
+            raise PermanentError(f"Text file is not valid UTF-8 (byte {exc.start}); re-save it as UTF-8") from exc
+        return DocumentContent(kind="text", pages=[PageText(page=1, text=text)])
     raise PermanentError(f"Unsupported content type: {content_type}")
 
 
 def _pdf(path: Path) -> DocumentContent:
     from pypdf import PdfReader
-    from pypdf.errors import PdfReadError
 
     try:
         reader = PdfReader(path)
         pages = [PageText(page=i + 1, text=(p.extract_text() or "").strip())
                  for i, p in enumerate(reader.pages)]
-    except (PdfReadError, ValueError) as exc:
-        raise PermanentError(f"Corrupt or unreadable PDF: {exc}") from exc
+    except OSError:
+        raise
+    except Exception as exc:  # pypdf raises PdfReadError, but also KeyError, struct.error, ...
+        raise PermanentError(f"Corrupt or unreadable PDF: {type(exc).__name__}: {exc}") from exc
     if not pages:
         raise PermanentError("PDF has no pages")
     if sum(len(p.text) for p in pages) < MIN_TEXT_CHARS_PER_PAGE * len(pages):
@@ -69,21 +77,25 @@ def _pdf(path: Path) -> DocumentContent:
 def _xlsx(path: Path) -> DocumentContent:
     from openpyxl import load_workbook
 
+    pages = []
     try:
         wb = load_workbook(path, data_only=True, read_only=True)
-    except Exception as exc:  # openpyxl raises a zoo of exception types
-        raise PermanentError(f"Corrupt or unreadable spreadsheet: {exc}") from exc
-    pages = []
-    for ws in wb.worksheets:
-        lines = []
-        for row in ws.iter_rows():
-            cells = [f"{c.coordinate}={c.value}" for c in row
-                     if c.value is not None and hasattr(c, "coordinate")]
-            if cells:
-                lines.append(" | ".join(cells))
-        if lines:
-            pages.append(PageText(sheet=ws.title, text="\n".join(lines)))
-    wb.close()
+        try:
+            for ws in wb.worksheets:
+                lines = []
+                for row in ws.iter_rows():
+                    cells = [f"{c.coordinate}={c.value}" for c in row
+                             if c.value is not None and hasattr(c, "coordinate")]
+                    if cells:
+                        lines.append(" | ".join(cells))
+                if lines:
+                    pages.append(PageText(sheet=ws.title, text="\n".join(lines)))
+        finally:
+            wb.close()
+    except OSError:
+        raise
+    except Exception as exc:  # openpyxl raises a zoo of exception types, during load and iteration
+        raise PermanentError(f"Corrupt or unreadable spreadsheet: {type(exc).__name__}: {exc}") from exc
     if not pages:
         raise PermanentError("Spreadsheet is empty")
     return DocumentContent(kind="xlsx", pages=pages)

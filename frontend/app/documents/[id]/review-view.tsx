@@ -4,13 +4,22 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useId, useState } from "react";
 import { api, ApiError, errorMessage } from "@/lib/api";
-import { ReviewAction, type DocumentDetail, type ExtractedField, type ValidationIssue } from "@/lib/contracts";
+import {
+  AcceptFlagged, ReviewAction, type DocumentDetail, type Evidence, type ExtractedField, type ValidationIssue,
+} from "@/lib/contracts";
 import { formatMinor, minorToInput, parseMoneyToMinor } from "@/lib/money";
+import { suggestedCorrection } from "@/lib/review";
 import {
   Badge, Button, ErrorNote, FIELD_LABELS, FOCUS_RING, INPUT_CLASS, Panel, StatusBadge, TableScroll, usePolled,
 } from "@/components/ui";
 
 const SOURCE_PANEL_ID = "source-evidence";
+
+const EVIDENCE_PROBLEM: Record<Exclude<Evidence, "verified">, string> = {
+  no_source: "No source text was quoted for this value.",
+  quote_not_found: "The quoted text was not found on the cited page. Check the original before approving.",
+  value_not_in_quote: "The quoted text does not contain this figure. Check the original before approving.",
+};
 
 export function ReviewView() {
   const { id } = useParams<{ id: string }>();
@@ -76,7 +85,7 @@ export function ReviewView() {
           {!readOnly && (
             <Button onClick={() => run(() => api.approveAll(doc.id), `Approved ${pending} values.`)}
               disabled={busy || pending === 0}
-              title="Approve every value that passed all checks. Flagged values still need individual review.">
+              title="Approve every value that passed all checks, including the source check. Flagged values still need individual review.">
               {pending === 0 ? "No clean values to approve" : `Approve ${pending} clean value${pending === 1 ? "" : "s"}`}
             </Button>
           )}
@@ -180,32 +189,50 @@ function FieldRow({ field, label, currency, active, issues, busy, readOnly, onSe
   field: ExtractedField; label: string; currency: string | null; active: boolean; issues: ValidationIssue[];
   busy: boolean; readOnly: boolean; onSelect: () => void; onAct: (a: ReviewAction) => Promise<boolean>;
 }) {
-  const [editing, setEditing] = useState(false);
-  const suggested = issues.find((i) => i.expected_minor !== null)?.expected_minor ?? null;
+  // "correct" enters a new value; "accept" approves a flagged value as printed, which needs a note.
+  const [mode, setMode] = useState<"correct" | "accept" | null>(null);
+  const suggestion = suggestedCorrection(field, issues);
   const [value, setValue] = useState("");
   const [note, setNote] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const ids = { value: useId(), note: useId(), err: useId(), hint: useId() };
   const reviewed = field.status === "approved" || field.status === "corrected";
+  const flagged = field.status === "flagged";
 
-  function startEdit() {
-    setValue(minorToInput(suggested ?? field.value_minor));
+  function open(next: "correct" | "accept") {
+    setValue(minorToInput(suggestion?.minor ?? field.value_minor));
     setNote("");
     setErr(null);
-    setEditing(true);
+    setMode(next);
     onSelect();
   }
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
-    const amount = parseMoneyToMinor(value);
-    if (!amount.ok) return setErr(amount.error);
-    const parsed = ReviewAction.safeParse({
-      action: "correct", value_minor: amount.minor, note, expected_version: field.version,
-    });
-    if (!parsed.success) return setErr(parsed.error.issues[0].message);
-    if (await onAct(parsed.data)) setEditing(false);
+    let action: ReviewAction;
+    if (mode === "accept") {
+      const parsed = AcceptFlagged.safeParse({ action: "approve", note, expected_version: field.version });
+      if (!parsed.success) return setErr(parsed.error.issues[0].message);
+      action = parsed.data;
+    } else {
+      const amount = parseMoneyToMinor(value);
+      if (!amount.ok) return setErr(amount.error);
+      const parsed = ReviewAction.safeParse({
+        action: "correct", value_minor: amount.minor, note, expected_version: field.version,
+      });
+      if (!parsed.success) return setErr(parsed.error.issues[0].message);
+      action = parsed.data;
+    }
+    if (await onAct(action)) setMode(null);
   }
+
+  const hint = mode === "accept"
+    ? "Approving a flagged value accepts its validation issue. Your note appears in the report's audit trail."
+    : suggestion?.source === "calculated"
+      ? "Pre-filled with the calculated value. Verify it against the source before saving."
+      : suggestion?.source === "other_document"
+        ? "Pre-filled with the value in the other document. Verify which source is right before saving."
+        : "Enter the amount as printed, e.g. 3,500,000 or 1200.50.";
 
   return (
     <>
@@ -219,8 +246,11 @@ function FieldRow({ field, label, currency, active, issues, busy, readOnly, onSe
           {field.status === "corrected" && (
             <div className="num text-xs text-stone-500">was {formatMinor(field.original_value_minor)}</div>
           )}
+          {field.evidence && field.evidence !== "verified" && !reviewed && (
+            <div className="text-xs text-amber-800">source not verified</div>
+          )}
         </th>
-        <td className={`num px-2 py-2.5 text-right ${field.status === "flagged" ? "text-rose-700" : ""}`}>
+        <td className={`num px-2 py-2.5 text-right ${flagged ? "text-rose-700" : ""}`}>
           {formatMinor(field.value_minor, currency)}
         </td>
         <td className="num px-2 py-2.5 text-xs text-stone-500">
@@ -230,47 +260,59 @@ function FieldRow({ field, label, currency, active, issues, busy, readOnly, onSe
         <td className="whitespace-nowrap px-4 py-2 text-right">
           {!readOnly && !reviewed && (
             <>
-              <Button variant="ghost" disabled={busy}
-                onClick={() => onAct({ action: "approve", expected_version: field.version })}
-                aria-label={field.value_minor === null ? `Acknowledge ${label} is not in the document` : `Approve ${label}`}>
-                {field.value_minor === null ? "Ack" : "Approve"}
-              </Button>
-              <Button variant="ghost" disabled={busy} onClick={startEdit} aria-label={`Correct ${label}`}
-                aria-expanded={editing}>Correct</Button>
+              {flagged ? (
+                <Button variant="ghost" disabled={busy} onClick={() => open("accept")}
+                  aria-label={field.value_minor === null ? `Acknowledge ${label} is missing` : `Accept ${label} as printed`}
+                  aria-expanded={mode === "accept"}>{field.value_minor === null ? "Ack…" : "Accept…"}</Button>
+              ) : (
+                <Button variant="ghost" disabled={busy}
+                  onClick={() => onAct({ action: "approve", expected_version: field.version })}
+                  aria-label={field.value_minor === null ? `Acknowledge ${label} is not in the document` : `Approve ${label}`}>
+                  {field.value_minor === null ? "Ack" : "Approve"}
+                </Button>
+              )}
+              <Button variant="ghost" disabled={busy} onClick={() => open("correct")} aria-label={`Correct ${label}`}
+                aria-expanded={mode === "correct"}>Correct</Button>
             </>
           )}
           {!readOnly && reviewed && (
-            <Button variant="ghost" disabled={busy} onClick={startEdit} aria-label={`Edit ${label}`}
-              aria-expanded={editing}>Edit</Button>
+            <Button variant="ghost" disabled={busy} onClick={() => open("correct")} aria-label={`Edit ${label}`}
+              aria-expanded={mode === "correct"}>Edit</Button>
           )}
         </td>
       </tr>
-      {editing && (
+      {mode && (
         <tr className="bg-stone-100">
           <td colSpan={5} className="px-4 pb-3">
-            <form onSubmit={submit} onKeyDown={(e) => e.key === "Escape" && setEditing(false)}
-              className="flex flex-wrap items-start gap-2" aria-label={`Correct ${label}`}>
-              <div>
-                <label htmlFor={ids.value} className="sr-only">Corrected {label}{currency ? ` in ${currency}` : ""}</label>
-                <input id={ids.value} autoFocus inputMode="decimal" value={value} onChange={(e) => setValue(e.target.value)}
-                  aria-invalid={!!err} aria-describedby={`${err ? ids.err : ""} ${ids.hint}`.trim()}
-                  className={`num w-40 text-right ${INPUT_CLASS}`} placeholder="Amount" />
-              </div>
+            <form onSubmit={submit} onKeyDown={(e) => e.key === "Escape" && setMode(null)}
+              className="flex flex-wrap items-start gap-2"
+              aria-label={mode === "accept" ? `Accept ${label} as printed` : `Correct ${label}`}>
+              {mode === "correct" && (
+                <div>
+                  <label htmlFor={ids.value} className="sr-only">Corrected {label}{currency ? ` in ${currency}` : ""}</label>
+                  <input id={ids.value} autoFocus inputMode="decimal" value={value} onChange={(e) => setValue(e.target.value)}
+                    aria-invalid={!!err} aria-describedby={`${err ? ids.err : ""} ${ids.hint}`.trim()}
+                    className={`num w-40 text-right ${INPUT_CLASS}`} placeholder="Amount" />
+                </div>
+              )}
               <div className="min-w-56 flex-1">
-                <label htmlFor={ids.note} className="sr-only">Reason for the correction</label>
-                <input id={ids.note} value={note} onChange={(e) => setNote(e.target.value)} maxLength={1000}
-                  placeholder="Why? e.g. typo in statement, confirmed against p.2 subtotals"
-                  aria-invalid={!!err} aria-describedby={err ? ids.err : undefined}
+                <label htmlFor={ids.note} className="sr-only">
+                  {mode === "accept" ? "Why the value is right as printed" : "Reason for the correction"}
+                </label>
+                <input id={ids.note} autoFocus={mode === "accept"} value={note} onChange={(e) => setNote(e.target.value)}
+                  maxLength={1000}
+                  placeholder={mode === "accept"
+                    ? "Why is it right? e.g. one-off restructuring charge, confirmed in note 7"
+                    : "Why? e.g. typo in statement, confirmed against p.2 subtotals"}
+                  aria-invalid={!!err} aria-describedby={`${err ? ids.err : ""} ${ids.hint}`.trim()}
                   className={`w-full ${INPUT_CLASS}`} />
               </div>
-              <Button type="submit" variant="primary" disabled={busy}>{busy ? "Saving…" : "Save correction"}</Button>
-              <Button variant="ghost" onClick={() => setEditing(false)}>Cancel</Button>
+              <Button type="submit" variant="primary" disabled={busy}>
+                {busy ? "Saving…" : mode === "accept" ? "Accept value" : "Save correction"}
+              </Button>
+              <Button variant="ghost" onClick={() => setMode(null)}>Cancel</Button>
             </form>
-            <p id={ids.hint} className="mt-1 text-xs text-stone-500">
-              {suggested !== null
-                ? "Pre-filled with the calculated value. Verify it against the source before saving."
-                : "Enter the amount as printed, e.g. 3,500,000 or 1200.50."}
-            </p>
+            <p id={ids.hint} className="mt-1 text-xs text-stone-500">{hint}</p>
             {err && <p id={ids.err} role="alert" className="mt-1 text-xs text-rose-700">{err}</p>}
           </td>
         </tr>
@@ -298,6 +340,11 @@ function SourcePanel({ doc, field }: { doc: DocumentDetail["document"]; field: E
               <b>{FIELD_LABELS[field.name] ?? field.name}</b>
               {location && <Badge>{location}</Badge>}
             </div>
+            {field.evidence && field.evidence !== "verified" && (
+              <p className="mt-2 rounded bg-amber-50 px-3 py-2 text-xs text-amber-900 ring-1 ring-amber-300">
+                {EVIDENCE_PROBLEM[field.evidence]}
+              </p>
+            )}
             {field.quote ? (
               <blockquote className="num mt-2 break-words rounded bg-amber-50 px-3 py-2 text-xs ring-1 ring-amber-200">{field.quote}</blockquote>
             ) : (

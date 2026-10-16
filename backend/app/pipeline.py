@@ -21,12 +21,14 @@ from .contracts import (
     FINANCIAL_FIELDS,
     PIPELINE_VERSION,
     DocumentStatus,
+    Evidence,
     FieldStatus,
     FinancialExtraction,
     Severity,
 )
 from .db import connect, iso, new_id, transaction
 from .errors import PermanentError, RetryableError
+from .evidence import check_evidence
 from .extraction import PROMPT_VERSION, Extractor, get_extractor
 from .money import to_minor
 from .processing import extract_content
@@ -81,13 +83,16 @@ def process_document(document_id: str, attempt: int = 1, extractor: Extractor | 
 
     # Saving and revalidating commit together: no window where fields exist
     # without their validation issues.
+    evidence = {name: check_evidence(getattr(result, name), content) for name in FINANCIAL_FIELDS}
     with transaction() as conn:
-        save_extraction(conn, document_id, result, extractor.name, extractor.model)
+        save_extraction(conn, document_id, result, extractor.name, extractor.model, evidence)
         revalidate(conn, doc["project_id"], processed_document_id=document_id)
 
 
 def save_extraction(conn: sqlite3.Connection, document_id: str, x: FinancialExtraction,
-                    extractor_name: str, model: str | None) -> None:
+                    extractor_name: str, model: str | None,
+                    evidence: dict[str, Evidence | None] | None = None) -> None:
+    evidence = evidence or {}
     mult = x.unit_multiplier
     conn.execute(
         """INSERT INTO extractions (id, document_id, pipeline_version, extractor, model, prompt_version,
@@ -113,18 +118,18 @@ def save_extraction(conn: sqlite3.Connection, document_id: str, x: FinancialExtr
         # version invalidates any review form opened against the old value.
         conn.execute(
             """INSERT INTO fields (id, document_id, name, value_minor, original_value_minor, page, sheet,
-                   cell, quote, confidence, status, version)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                   cell, quote, confidence, status, evidence, version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                ON CONFLICT(document_id, name) DO UPDATE SET
                    value_minor = excluded.value_minor, original_value_minor = excluded.original_value_minor,
                    page = excluded.page, sheet = excluded.sheet, cell = excluded.cell,
                    quote = excluded.quote, confidence = excluded.confidence,
-                   status = excluded.status, version = fields.version + 1
+                   status = excluded.status, evidence = excluded.evidence, version = fields.version + 1
                WHERE fields.status NOT IN ('approved', 'corrected')""",
             (new_id("fld"), document_id, name, value, value,
              src.page if src else None, src.sheet if src else None,
              src.cell if src else None, src.quote if src else None,
-             ev.confidence, status),
+             ev.confidence, status, evidence.get(name)),
         )
 
 
@@ -148,14 +153,16 @@ def _load_facts(conn: sqlite3.Connection, project_id: str) -> list[DocFacts]:
     ).fetchall()
     facts = []
     for r in rows:
-        fields = conn.execute("SELECT name, value_minor, confidence, status FROM fields WHERE document_id = ?",
-                              (r["id"],)).fetchall()
+        fields = conn.execute(
+            "SELECT name, value_minor, confidence, status, evidence FROM fields WHERE document_id = ?",
+            (r["id"],)).fetchall()
         facts.append(DocFacts(
             document_id=r["id"], file_name=r["file_name"], company_name=r["company_name"],
             fiscal_year=r["fiscal_year"], currency=r["currency"],
             values={f["name"]: f["value_minor"] for f in fields},
             # Analyst-reviewed values are trusted regardless of model confidence.
             confidence={f["name"]: (1.0 if f["status"] in REVIEWED else f["confidence"]) for f in fields},
+            evidence={f["name"]: f["evidence"] for f in fields},
         ))
     return facts
 

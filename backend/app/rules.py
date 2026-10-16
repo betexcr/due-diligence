@@ -31,6 +31,7 @@ class DocFacts:
     currency: str | None
     values: dict[str, int | None]  # integer minor units
     confidence: dict[str, float] = field(default_factory=dict)
+    evidence: dict[str, str | None] = field(default_factory=dict)  # app.contracts.Evidence values
 
 
 @dataclass
@@ -78,6 +79,15 @@ def validate_document(d: DocFacts) -> list[Issue]:
         if v.get(f) is not None and c < settings.min_confidence:
             issue("low_confidence", Severity.warning,
                   f"Low extraction confidence ({c:.0%}) for {f.replace('_', ' ')}.", [f])
+
+    for f, e in d.evidence.items():
+        if v.get(f) is None or e in (None, "verified"):
+            continue
+        why = {"no_source": "no source text was quoted",
+               "quote_not_found": "the quoted text was not found on the cited page"}.get(
+            e, "the quoted text does not contain the reported figure")
+        issue("source_not_verified", Severity.warning,
+              f"Cited source for {f.replace('_', ' ')} could not be verified: {why}.", [f])
 
     rev, cogs, gp = v.get("revenue"), v.get("cost_of_goods_sold"), v.get("gross_profit")
     opex, opinc, ni = v.get("operating_expenses"), v.get("operating_income"), v.get("net_income")

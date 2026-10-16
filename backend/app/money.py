@@ -12,6 +12,10 @@ from decimal import ROUND_HALF_EVEN, Decimal
 
 MINOR_PER_UNIT = 100
 
+# Largest magnitude the API accepts: fits SQLite INTEGER and is exact as a
+# JavaScript number, so the UI never silently rounds a value it displays.
+MAX_MINOR = 2**53 - 1
+
 
 def to_minor(value: float | int | str | Decimal, multiplier: int = 1) -> int:
     """Printed value x unit multiplier -> integer minor units, banker's rounding."""

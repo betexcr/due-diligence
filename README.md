@@ -65,7 +65,8 @@ Tests: `cd backend && uv run pytest`, and `cd frontend && npm test` (money parsi
 3. Drop `alpha_fs_2024.pdf` again: reported as a duplicate, nothing reprocessed.
 4. Open the 2024 review. The flagged value shows the page-2 quote and the PDF at that page.
    Correct it to 3,500,000 (a note is mandatory). Both issues disappear, because validation is
-   recomputed from current values.
+   recomputed from current values. (A flagged value can also be *accepted* as printed, but only
+   with a note, which goes in the audit trail; that is what marks its issue "accepted".)
 5. *Approve clean values* on each document. The report still says draft: the corrupt upload failed.
    *Exclude* it with a reason on the project page; the report becomes ready, showing only approved
    figures, corrections marked, sources cited, the exclusion and the full audit trail.
@@ -82,12 +83,12 @@ Tests: `cd backend && uv run pytest`, and `cd frontend && npm test` (money parsi
 | **Dead-letter queue** | Permanent errors, or exhausted retries, set `status=dead` and write a `dead_letters` row; operators requeue with a fresh budget. |
 | **Worker timeouts** | Each job runs in a child process killed after `DD_JOB_TIMEOUT` (Python can't kill a hung thread). `job_timeout < lease`, so a healthy worker finishes before anyone can steal its job ([worker.py](backend/app/worker.py)). |
 | **Structured I/O contracts** | Pydantic `FinancialExtraction` is the LLM output schema (`messages.parse`), re-validated in the pipeline; `extra="forbid"` rejects hallucinated keys. The UI parses every API response, and validates every request body, with Zod mirrors ([contracts.py](backend/app/contracts.py), [contracts.ts](frontend/lib/contracts.ts)). |
-| **LLM doesn't decide** | The model must return `null` instead of guessing, plus a verbatim quote and page/cell per value. All checks are deterministic code ([rules.py](backend/app/rules.py)). |
+| **LLM doesn't decide** | The model must return `null` instead of guessing, plus a verbatim quote and page/cell per value. Code then confirms the quote really is on the cited page and contains the figure; an unverified source flags the value ([evidence.py](backend/app/evidence.py)). All checks are deterministic code ([rules.py](backend/app/rules.py)). |
 | **Money** | Integer minor units (hundredths of the currency unit) in the database, rules and API; the LLM's printed numbers are converted once with `Decimal` ([money.py](backend/app/money.py), [money.ts](frontend/lib/money.ts)). |
 | **Concurrent review** | Every field has a `version`; reviews send the version they saw and the update is compare-and-set, so a stale form gets 409 instead of overwriting. Reprocessing bumps versions too. Review + revalidation commit in one transaction. |
 | **Schema evolution** | Numbered migrations tracked in `PRAGMA user_version`, each atomic with foreign-key checks; CHECK constraints guard statuses, confidence range and correction notes in the database itself ([db.py](backend/app/db.py)). |
 | **Prompt injection** | Document text is wrapped as untrusted data, closing delimiters inside it are neutralised, and the system prompt forbids following embedded instructions. The fixed output schema and deterministic checks limit the impact of anything that slips through. Prompt version and model id are stored with each extraction. |
-| **Human approval** | Report readiness requires: no open errors, every extracted value approved/corrected, no failed documents. Corrections require a note and are kept in an audit trail. |
+| **Human approval** | Report readiness requires: no open errors, every extracted value approved/corrected, no failed documents. Corrections, and approvals of flagged values, require a note and are kept in an audit trail. |
 
 ## Prototype shortcuts → production path
 

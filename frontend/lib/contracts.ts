@@ -7,6 +7,10 @@ export const DocumentStatus = z.enum(["uploaded", "processing", "needs_review", 
 export const JobStatus = z.enum(["queued", "running", "succeeded", "dead"]);
 export const FieldStatus = z.enum(["extracted", "flagged", "missing", "approved", "corrected"]);
 export const Severity = z.enum(["error", "warning", "info"]);
+export const Evidence = z.enum(["verified", "no_source", "quote_not_found", "value_not_in_quote"]);
+
+// Mirrors backend/app/money.py MAX_MINOR: the largest amount that is exact as a JS number.
+export const MAX_MINOR = Number.MAX_SAFE_INTEGER;
 
 export const Project = z.object({
   id: z.string(),
@@ -70,6 +74,7 @@ export const ExtractedField = z.object({
   quote: z.string().nullable(),
   confidence: z.number().min(0).max(1),
   status: FieldStatus,
+  evidence: Evidence.nullable(),
   version: z.number().int().min(1),
 });
 
@@ -139,10 +144,17 @@ export const ReviewAction = z.discriminatedUnion("action", [
   z.object({
     action: z.literal("correct"),
     expected_version: z.number().int().min(1),
-    value_minor: z.number().int({ error: "Enter an amount" }),
+    value_minor: z.number().int({ error: "Enter an amount" }).min(-MAX_MINOR).max(MAX_MINOR),
     note: z.string().trim().min(1, "Explain where the corrected value comes from").max(1000),
   }),
 ]);
+
+// Approving a flagged value accepts its validation issue, so the API requires a note.
+export const AcceptFlagged = z.object({
+  action: z.literal("approve"),
+  expected_version: z.number().int().min(1),
+  note: z.string().trim().min(1, "Explain why the value is right as printed").max(1000),
+});
 
 export const DocumentExclusion = z.object({
   reason: z.string().trim().min(1, "Give a reason; it is shown in the report").max(500),
@@ -157,3 +169,4 @@ export type ValidationIssue = z.infer<typeof ValidationIssue>;
 export type ProjectDetail = z.infer<typeof ProjectDetail>;
 export type DocumentDetail = z.infer<typeof DocumentDetail>;
 export type ReviewAction = z.infer<typeof ReviewAction>;
+export type Evidence = z.infer<typeof Evidence>;

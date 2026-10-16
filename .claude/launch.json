@@ -4,7 +4,7 @@
     {
       "name": "api",
       "runtimeExecutable": "uv",
-      "runtimeArgs": ["run", "--directory", "backend", "--env-file", ".env.development", "uvicorn", "app.main:app", "--port", "8000"],
+      "runtimeArgs": ["run", "--directory", "backend", "--env-file", ".env.development", "--env-file", ".env", "uvicorn", "app.main:app", "--port", "8000"],
       "port": 8000
     },
     {

@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+
+from .money import MAX_MINOR
 
 PIPELINE_VERSION = "extract-v1"
 
@@ -132,6 +134,15 @@ class FieldStatus(StrEnum):
     corrected = "corrected"
 
 
+class Evidence(StrEnum):
+    """Deterministic check of the model's cited source (see app/evidence.py)."""
+
+    verified = "verified"  # quote found in the cited page/sheet and contains the value
+    no_source = "no_source"  # a value with no quote at all
+    quote_not_found = "quote_not_found"
+    value_not_in_quote = "value_not_in_quote"
+
+
 class Severity(StrEnum):
     error = "error"
     warning = "warning"
@@ -199,6 +210,7 @@ class ExtractedField(BaseModel):
     quote: str | None
     confidence: float
     status: FieldStatus
+    evidence: Evidence | None = Field(None, description="None when there is no value to check")
     version: int = Field(..., ge=1, description="Optimistic concurrency token; send back on review")
 
 
@@ -217,8 +229,10 @@ class ValidationIssue(BaseModel):
 
 class ReviewAction(Strict):
     action: Literal["approve", "correct"]
-    value_minor: int | None = Field(None, description="Required for 'correct'")
-    note: str | None = Field(None, max_length=1000)
+    value_minor: int | None = Field(None, ge=-MAX_MINOR, le=MAX_MINOR, description="Required for 'correct'")
+    # Required for 'correct' (checked below) and for approving a flagged value (checked
+    # in the API, which knows the field's status).
+    note: Annotated[str, StringConstraints(strip_whitespace=True, max_length=1000)] | None = None
     expected_version: int = Field(..., ge=1, description="The field version the reviewer saw")
     # TODO(auth): replace with the authenticated user's identity.
     reviewer: str = Field("analyst", min_length=1, max_length=100)
@@ -228,13 +242,14 @@ class ReviewAction(Strict):
         if self.action == "correct":
             if self.value_minor is None:
                 raise ValueError("A correction needs a value")
-            if not (self.note and self.note.strip()):
+            if not self.note:
                 raise ValueError("A correction needs a note explaining the source of the new value")
         return self
 
 
 class DocumentExclusion(Strict):
-    reason: str = Field(..., min_length=1, max_length=500)
+    # Stripped before the length check, so a whitespace-only reason is rejected.
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
     reviewer: str = Field("analyst", min_length=1, max_length=100)
 
 

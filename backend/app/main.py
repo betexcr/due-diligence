@@ -215,8 +215,13 @@ def review_field(field_id: str, body: ReviewAction) -> ExtractedField:
         d = _active_document(conn, f["document_id"])
         if f["version"] != body.expected_version:
             raise Conflict("This value changed since you loaded it. Reload and review again.")
+        # Approving a flagged value as printed is what marks its validation issues
+        # accepted (see pipeline.revalidate), so it must carry a justification.
+        if body.action == "approve" and f["status"] == FieldStatus.flagged and not body.note:
+            raise HTTPException(422, "Approving a flagged value accepts its validation issue; "
+                                     "add a note explaining why the value is right as printed")
         new_value = body.value_minor if body.action == "correct" else f["value_minor"]
-        _record_review(conn, f, body.action, new_value, body.note, body.reviewer)
+        _record_review(conn, f, body.action, new_value, body.note or None, body.reviewer)
         revalidate(conn, d["project_id"])
         return _field(conn.execute("SELECT * FROM fields WHERE id = ?", (field_id,)).fetchone())
 
@@ -229,7 +234,7 @@ def approve_all_clean(document_id: str) -> DocumentDetail:
         rows = conn.execute("SELECT * FROM fields WHERE document_id = ? AND status = 'extracted'",
                             (document_id,)).fetchall()
         for f in rows:
-            _record_review(conn, f, "approve", f["value_minor"], "bulk approve: passed all checks", "analyst")
+            _record_review(conn, f, "approve", f["value_minor"], "bulk approve: no validation issues, source verified", "analyst")
         revalidate(conn, d["project_id"])
     return get_document(document_id)
 
@@ -243,7 +248,7 @@ def exclude_document(document_id: str, body: DocumentExclusion) -> Document:
         if d["status"] in (DocumentStatus.uploaded, DocumentStatus.processing):
             raise Conflict("Document is still being processed; wait for it to finish or fail")
         conn.execute("UPDATE documents SET excluded_at = ?, excluded_reason = ?, excluded_by = ? WHERE id = ?",
-                     (iso(), body.reason.strip(), body.reviewer, document_id))
+                     (iso(), body.reason, body.reviewer, document_id))
         revalidate(conn, d["project_id"])
         return _doc(conn.execute(f"{DOC_SELECT} WHERE d.id = ?", (document_id,)).fetchone())
 

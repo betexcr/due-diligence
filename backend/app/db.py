@@ -213,7 +213,23 @@ ALTER TABLE documents ADD COLUMN excluded_reason TEXT;
 ALTER TABLE documents ADD COLUMN excluded_by TEXT;
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, SCHEMA_V1), (2, SCHEMA_V2)]
+# Migration 3: deterministic evidence check per field, and a non-blank reason on
+# every exclusion. Given as a statement list because trigger bodies contain ';'.
+_EXCLUSION_NEEDS_REASON = """
+    WHEN NEW.excluded_at IS NOT NULL AND length(trim(coalesce(NEW.excluded_reason, ''))) = 0
+    BEGIN SELECT RAISE(ABORT, 'An excluded document needs a non-blank reason'); END"""
+SCHEMA_V3 = [
+    """ALTER TABLE fields ADD COLUMN evidence TEXT
+       CHECK (evidence IS NULL OR evidence IN ('verified', 'no_source', 'quote_not_found', 'value_not_in_quote'))""",
+    # Exclusions saved before the API rejected blank reasons keep a visible marker.
+    """UPDATE documents SET excluded_reason = '(no reason recorded)'
+       WHERE excluded_at IS NOT NULL AND length(trim(coalesce(excluded_reason, ''))) = 0""",
+    f"CREATE TRIGGER documents_exclusion_reason_insert BEFORE INSERT ON documents {_EXCLUSION_NEEDS_REASON}",
+    f"""CREATE TRIGGER documents_exclusion_reason_update BEFORE UPDATE OF excluded_at, excluded_reason
+        ON documents {_EXCLUSION_NEEDS_REASON}""",
+]
+
+MIGRATIONS: list[tuple[int, str | list[str]]] = [(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3)]
 
 
 def now() -> datetime:
@@ -281,7 +297,7 @@ def migrate(conn: sqlite3.Connection, target: int | None = None) -> int:
         conn.execute("PRAGMA foreign_keys = OFF")
         try:
             conn.execute("BEGIN IMMEDIATE")
-            for statement in _split_sql(script):
+            for statement in (script if isinstance(script, list) else _split_sql(script)):
                 conn.execute(statement)
             violations = conn.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
