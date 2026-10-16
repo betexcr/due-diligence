@@ -30,7 +30,7 @@ from .contracts import (
 )
 from .db import connect, init_db, iso, new_id, transaction
 from .ingestion import IngestionError, ingest
-from .pipeline import revalidate
+from .pipeline import backfill_evidence, open_issue_count, record_acceptances, revalidate, revalidate_all
 from .report import build_report, readiness, render_html
 from .worker import WorkerPool
 
@@ -40,6 +40,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    backfill_evidence()
+    revalidate_all()
     pool = None
     if os.environ.get("DD_START_WORKERS", "1") == "1":
         pool = WorkerPool()
@@ -192,7 +194,9 @@ def _active_document(conn, document_id: str):
 
 
 def _record_review(conn, field, action: str, new_value: int | None, note: str | None, reviewer: str) -> None:
-    status = FieldStatus.corrected if action == "correct" else FieldStatus.approved
+    # Accepting a previously corrected value keeps it marked as a correction.
+    corrected = action == "correct" or new_value != field["original_value_minor"]
+    status = FieldStatus.corrected if corrected else FieldStatus.approved
     # Compare-and-set on version: a concurrent review or a reprocessing run that
     # changed the field since the reviewer loaded it makes this a no-op.
     cur = conn.execute(
@@ -200,10 +204,12 @@ def _record_review(conn, field, action: str, new_value: int | None, note: str | 
         (new_value, status, field["id"], field["version"]))
     if cur.rowcount != 1:
         raise Conflict("This value changed since you loaded it. Reload and review again.")
+    review_id = new_id("rev")
     conn.execute(
         """INSERT INTO reviews (id, field_id, action, old_value_minor, new_value_minor, note, reviewer, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (new_id("rev"), field["id"], action, field["value_minor"], new_value, note, reviewer, iso()))
+        (review_id, field["id"], action, field["value_minor"], new_value, note, reviewer, iso()))
+    record_acceptances(conn, field["document_id"], field["name"], review_id)
 
 
 @app.post("/api/fields/{field_id}/review", response_model=ExtractedField)
@@ -215,11 +221,13 @@ def review_field(field_id: str, body: ReviewAction) -> ExtractedField:
         d = _active_document(conn, f["document_id"])
         if f["version"] != body.expected_version:
             raise Conflict("This value changed since you loaded it. Reload and review again.")
-        # Approving a flagged value as printed is what marks its validation issues
-        # accepted (see pipeline.revalidate), so it must carry a justification.
-        if body.action == "approve" and f["status"] == FieldStatus.flagged and not body.note:
-            raise HTTPException(422, "Approving a flagged value accepts its validation issue; "
-                                     "add a note explaining why the value is right as printed")
+        # Approving a value that has open issues accepts them (see
+        # pipeline.record_acceptances), so it must carry a justification. This
+        # covers flagged values and reviewed values caught up in a new issue.
+        # 409: whether a note is needed depends on the field's current state.
+        if body.action == "approve" and not body.note and open_issue_count(conn, d["id"], f["name"]):
+            raise Conflict("Approving this value accepts its open validation issues; "
+                           "add a note explaining why the value is right as printed")
         new_value = body.value_minor if body.action == "correct" else f["value_minor"]
         _record_review(conn, f, body.action, new_value, body.note or None, body.reviewer)
         revalidate(conn, d["project_id"])

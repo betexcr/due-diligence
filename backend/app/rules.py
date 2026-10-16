@@ -32,6 +32,7 @@ class DocFacts:
     values: dict[str, int | None]  # integer minor units
     confidence: dict[str, float] = field(default_factory=dict)
     evidence: dict[str, str | None] = field(default_factory=dict)  # app.contracts.Evidence values
+    corrected: set[str] = field(default_factory=set)  # fields holding an analyst-entered value
 
 
 @dataclass
@@ -80,12 +81,17 @@ def validate_document(d: DocFacts) -> list[Issue]:
             issue("low_confidence", Severity.warning,
                   f"Low extraction confidence ({c:.0%}) for {f.replace('_', ' ')}.", [f])
 
+    # The check is about the model's citation, so it does not apply to a value the
+    # analyst entered. A value without a recorded check fails closed.
     for f, e in d.evidence.items():
-        if v.get(f) is None or e in (None, "verified"):
+        if v.get(f) is None or e == "verified" or f in d.corrected:
             continue
-        why = {"no_source": "no source text was quoted",
-               "quote_not_found": "the quoted text was not found on the cited page"}.get(
-            e, "the quoted text does not contain the reported figure")
+        why = {
+            "no_source": "no source text was quoted",
+            "quote_not_found": "the quoted text was not found on the cited page",
+            "value_not_in_quote": "the quoted text does not contain the reported figure with its sign",
+            "ambiguous": "the quote does not show unambiguously which line item and figure the value is",
+        }.get(e, "the source was never checked")
         issue("source_not_verified", Severity.warning,
               f"Cited source for {f.replace('_', ' ')} could not be verified: {why}.", [f])
 

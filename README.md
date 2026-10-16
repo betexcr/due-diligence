@@ -32,6 +32,13 @@ cd backend && uv sync && uv run python scripts/make_samples.py
 ```
 
 ```bash
+cd backend && cp env.example .env
+```
+
+`backend/.env` is gitignored and holds local secrets (leave `ANTHROPIC_API_KEY` empty for the offline
+extractor). `.claude/launch.json` loads it, and uv refuses to start if the file is missing.
+
+```bash
 cd backend && uv run uvicorn app.main:app --port 8000
 ```
 
@@ -83,12 +90,12 @@ Tests: `cd backend && uv run pytest`, and `cd frontend && npm test` (money parsi
 | **Dead-letter queue** | Permanent errors, or exhausted retries, set `status=dead` and write a `dead_letters` row; operators requeue with a fresh budget. |
 | **Worker timeouts** | Each job runs in a child process killed after `DD_JOB_TIMEOUT` (Python can't kill a hung thread). `job_timeout < lease`, so a healthy worker finishes before anyone can steal its job ([worker.py](backend/app/worker.py)). |
 | **Structured I/O contracts** | Pydantic `FinancialExtraction` is the LLM output schema (`messages.parse`), re-validated in the pipeline; `extra="forbid"` rejects hallucinated keys. The UI parses every API response, and validates every request body, with Zod mirrors ([contracts.py](backend/app/contracts.py), [contracts.ts](frontend/lib/contracts.ts)). |
-| **LLM doesn't decide** | The model must return `null` instead of guessing, plus a verbatim quote and page/cell per value. Code then confirms the quote really is on the cited page and contains the figure; an unverified source flags the value ([evidence.py](backend/app/evidence.py)). All checks are deterministic code ([rules.py](backend/app/rules.py)). |
+| **LLM doesn't decide** | The model must return `null` instead of guessing, plus a verbatim quote and page/cell per value. Code then confirms the quote really is on the cited page, names a line item, and contains the figure with its sign and no competing figure (e.g. a second year column); an unverified or unchecked source flags the value ([evidence.py](backend/app/evidence.py)). All checks are deterministic code ([rules.py](backend/app/rules.py)). |
 | **Money** | Integer minor units (hundredths of the currency unit) in the database, rules and API; the LLM's printed numbers are converted once with `Decimal` ([money.py](backend/app/money.py), [money.ts](frontend/lib/money.ts)). |
 | **Concurrent review** | Every field has a `version`; reviews send the version they saw and the update is compare-and-set, so a stale form gets 409 instead of overwriting. Reprocessing bumps versions too. Review + revalidation commit in one transaction. |
 | **Schema evolution** | Numbered migrations tracked in `PRAGMA user_version`, each atomic with foreign-key checks; CHECK constraints guard statuses, confidence range and correction notes in the database itself ([db.py](backend/app/db.py)). |
 | **Prompt injection** | Document text is wrapped as untrusted data, closing delimiters inside it are neutralised, and the system prompt forbids following embedded instructions. The fixed output schema and deterministic checks limit the impact of anything that slips through. Prompt version and model id are stored with each extraction. |
-| **Human approval** | Report readiness requires: no open errors, every extracted value approved/corrected, no failed documents. Corrections, and approvals of flagged values, require a note and are kept in an audit trail. |
+| **Human approval** | Report readiness requires: no open errors, every extracted value approved/corrected, no failed documents. Corrections, and approvals of values with open issues, require a note and are kept in an audit trail. An issue is accepted only when every field in it was reviewed while that exact issue was open (`issue_acceptances`), so an issue a correction creates stays open instead of being accepted implicitly. |
 
 ## Prototype shortcuts → production path
 

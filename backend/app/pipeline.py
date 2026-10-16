@@ -12,29 +12,37 @@ upserted, never appended.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
+from decimal import Decimal
 from pathlib import Path
+
+from pydantic import ValidationError
 
 from .contracts import (
     FINANCIAL_FIELDS,
     PIPELINE_VERSION,
     DocumentStatus,
     Evidence,
+    ExtractedValue,
     FieldStatus,
     FinancialExtraction,
     Severity,
+    SourceRef,
 )
 from .db import connect, iso, new_id, transaction
 from .errors import PermanentError, RetryableError
 from .evidence import check_evidence
 from .extraction import PROMPT_VERSION, Extractor, get_extractor
-from .money import to_minor
+from .money import MINOR_PER_UNIT, AmountOutOfRange, to_minor
 from .processing import extract_content
 from .rules import DocFacts, validate_document, validate_project
 
 REVIEWED = (FieldStatus.approved, FieldStatus.corrected)
+
+log = logging.getLogger(__name__)
 
 # Demo hook: a document containing e.g. "SIMULATE_FAILURE: transient x2" fails
 # its first two attempts with a retryable error. Lets you show backoff, jitter
@@ -83,16 +91,19 @@ def process_document(document_id: str, attempt: int = 1, extractor: Extractor | 
 
     # Saving and revalidating commit together: no window where fields exist
     # without their validation issues.
-    evidence = {name: check_evidence(getattr(result, name), content) for name in FINANCIAL_FIELDS}
-    with transaction() as conn:
-        save_extraction(conn, document_id, result, extractor.name, extractor.model, evidence)
-        revalidate(conn, doc["project_id"], processed_document_id=document_id)
+    evidence = {name: check_evidence(getattr(result, name), content, name) for name in FINANCIAL_FIELDS}
+    try:
+        with transaction() as conn:
+            save_extraction(conn, document_id, result, extractor.name, extractor.model, evidence)
+            revalidate(conn, doc["project_id"], processed_document_id=document_id)
+    except AmountOutOfRange as exc:
+        # The same document will produce the same amount on every retry.
+        raise PermanentError(f"Unsupported amount: {exc}") from exc
 
 
 def save_extraction(conn: sqlite3.Connection, document_id: str, x: FinancialExtraction,
                     extractor_name: str, model: str | None,
-                    evidence: dict[str, Evidence | None] | None = None) -> None:
-    evidence = evidence or {}
+                    evidence: dict[str, Evidence | None]) -> None:
     mult = x.unit_multiplier
     conn.execute(
         """INSERT INTO extractions (id, document_id, pipeline_version, extractor, model, prompt_version,
@@ -163,6 +174,7 @@ def _load_facts(conn: sqlite3.Connection, project_id: str) -> list[DocFacts]:
             # Analyst-reviewed values are trusted regardless of model confidence.
             confidence={f["name"]: (1.0 if f["status"] in REVIEWED else f["confidence"]) for f in fields},
             evidence={f["name"]: f["evidence"] for f in fields},
+            corrected={f["name"] for f in fields if f["status"] == FieldStatus.corrected},
         ))
     return facts
 
@@ -172,20 +184,114 @@ def revalidate_project(project_id: str, processed_document_id: str | None = None
         revalidate(conn, project_id, processed_document_id)
 
 
+def backfill_evidence() -> int:
+    """Run the evidence check for values marked not_checked (saved before the check
+    existed), from the stored file and the model's original value and citation.
+    Values whose file can no longer be read stay not_checked. Returns the number
+    of fields updated."""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT f.id, f.document_id, f.name, f.original_value_minor, f.page, f.sheet, f.cell, f.quote,
+                      d.storage_path, d.content_type, e.unit_multiplier
+               FROM fields f JOIN documents d ON d.id = f.document_id
+               JOIN extractions e ON e.document_id = d.id
+               WHERE f.evidence = 'not_checked' AND f.original_value_minor IS NOT NULL
+               ORDER BY f.document_id""").fetchall()
+    by_doc: dict[str, list[sqlite3.Row]] = {}
+    for r in rows:
+        by_doc.setdefault(r["document_id"], []).append(r)
+
+    updated = 0
+    for document_id, fields in by_doc.items():
+        try:
+            content = extract_content(Path(fields[0]["storage_path"]), fields[0]["content_type"])
+        except (PermanentError, OSError) as exc:
+            log.warning("evidence backfill skipped document %s: %s", document_id, exc)
+            continue
+        results = []
+        for f in fields:
+            printed = Decimal(f["original_value_minor"]) / (MINOR_PER_UNIT * f["unit_multiplier"])
+            try:
+                source = SourceRef(page=f["page"], sheet=f["sheet"], cell=f["cell"],
+                                   quote=f["quote"]) if f["quote"] is not None else None
+                value = ExtractedValue(value=float(printed), source=source, confidence=1)
+            except ValidationError:
+                continue  # a stored citation the current contract rejects stays not_checked
+            results.append((check_evidence(value, content, f["name"]), f["id"]))
+        with transaction() as conn:
+            for evidence, field_id in results:
+                updated += conn.execute(
+                    "UPDATE fields SET evidence = ? WHERE id = ? AND evidence = 'not_checked'",
+                    (evidence, field_id)).rowcount
+    return updated
+
+
+def revalidate_all() -> None:
+    """Recompute stored issues for every project. Run at startup: rules, or a
+    migration such as 4 (which marks old values not_checked), may have changed
+    since the issues were stored."""
+    with connect() as conn:
+        project_ids = [r["id"] for r in conn.execute("SELECT id FROM projects")]
+    for project_id in project_ids:
+        revalidate_project(project_id)
+
+
+def _acceptance_key(document_id: str, field: str, rule: str, fields_json: str,
+                    expected: int | None, actual: int | None) -> tuple:
+    # An acceptance covers one exact issue: if any value in it changes, the
+    # expected/actual figures change and the new issue needs a new decision.
+    return (document_id, field, rule, fields_json, expected, actual)
+
+
+def record_acceptances(conn: sqlite3.Connection, document_id: str, field: str, review_id: str) -> None:
+    """Record that a review of `field` accepted the issues open on it right now.
+
+    Called for every analyst review, before revalidation. The reviewer saw these
+    issues (the field was flagged by them, or listed under them) when deciding.
+    Issues that only appear after the review are not covered by it.
+    """
+    for r in conn.execute(
+            """SELECT rule, fields, expected_minor, actual_minor FROM validation_issues
+               WHERE document_id = ? AND resolved = 0""", (document_id,)).fetchall():
+        if field in json.loads(r["fields"]):
+            conn.execute(
+                """INSERT OR IGNORE INTO issue_acceptances (id, document_id, field, rule, fields,
+                       expected_minor, actual_minor, review_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (new_id("acc"), document_id, field, r["rule"], r["fields"], r["expected_minor"],
+                 r["actual_minor"], review_id, iso()))
+
+
+def open_issue_count(conn: sqlite3.Connection, document_id: str, field: str) -> int:
+    """Unresolved error/warning issues that involve `field`."""
+    rows = conn.execute(
+        """SELECT fields FROM validation_issues WHERE document_id = ? AND resolved = 0
+           AND severity IN ('error', 'warning')""", (document_id,)).fetchall()
+    return sum(field in json.loads(r["fields"]) for r in rows)
+
+
 def revalidate(conn: sqlite3.Connection, project_id: str, processed_document_id: str | None = None) -> None:
     """Recompute every validation issue for the project from current field values.
 
     Runs inside the caller's transaction so a review or an extraction and the
     issues it implies commit atomically. Recomputing (rather than patching)
     keeps issues a pure function of the data: a correction that fixes an
-    identity makes its issue disappear. An issue whose fields an analyst has
-    all approved is kept but marked resolved (accepted). Excluded documents
+    identity makes its issue disappear. An issue is resolved (accepted) only
+    when every field in it was reviewed while that exact issue was open (see
+    record_acceptances); one that first appears after its fields were reviewed,
+    e.g. because a correction broke an identity, stays open. Excluded documents
     take no part.
     """
     project = conn.execute("SELECT company_name FROM projects WHERE id = ?", (project_id,)).fetchone()
     facts = _load_facts(conn, project_id)
     issues = [i for d in facts for i in validate_document(d)]
     issues += validate_project(project["company_name"], facts)
+    accepted = {
+        _acceptance_key(r["document_id"], r["field"], r["rule"], r["fields"], r["expected_minor"], r["actual_minor"])
+        for r in conn.execute(
+            """SELECT a.* FROM issue_acceptances a JOIN documents d ON d.id = a.document_id
+               WHERE d.project_id = ?""", (project_id,))
+    }
 
     rows = conn.execute(
         """SELECT f.document_id, f.name, f.status, f.value_minor FROM fields f
@@ -198,7 +304,11 @@ def revalidate(conn: sqlite3.Connection, project_id: str, processed_document_id:
     flagged: set[tuple[str, str]] = set()
     for i in issues:
         refs = [(i.document_id, f) for f in i.fields] if i.document_id else []
-        resolved = bool(refs) and all(statuses.get(r) in REVIEWED for r in refs)
+        fields_json = json.dumps(i.fields)
+        resolved = bool(refs) and all(
+            statuses.get(r) in REVIEWED
+            and _acceptance_key(*r, i.rule, fields_json, i.expected, i.actual) in accepted
+            for r in refs)
         if not resolved and i.severity != Severity.info:
             flagged.update(refs)
         conn.execute(
@@ -206,7 +316,7 @@ def revalidate(conn: sqlite3.Connection, project_id: str, processed_document_id:
                    fields, expected_minor, actual_minor, resolved, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (new_id("iss"), project_id, i.document_id, i.rule, i.severity, i.message,
-             json.dumps(i.fields), i.expected, i.actual, int(resolved), iso()),
+             fields_json, i.expected, i.actual, int(resolved), iso()),
         )
 
     for key, status in statuses.items():

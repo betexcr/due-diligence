@@ -121,7 +121,9 @@ export function ErrorNote({ error, onDismiss }: { error: string | null; onDismis
 export function TableScroll({ children, label }: { children: React.ReactNode; label: string }) {
   return (
     // tabIndex lets keyboard users scroll the region; role/label make it announceable.
-    <div role="region" aria-label={label} tabIndex={0} className={`overflow-x-auto ${FOCUS_RING}`}>
+    // `relative` contains absolutely positioned sr-only text, which would otherwise
+    // escape the scroller and widen the page on narrow screens.
+    <div role="region" aria-label={label} tabIndex={0} className={`relative overflow-x-auto ${FOCUS_RING}`}>
       {children}
     </div>
   );

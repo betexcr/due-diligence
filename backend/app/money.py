@@ -17,12 +17,20 @@ MINOR_PER_UNIT = 100
 MAX_MINOR = 2**53 - 1
 
 
+class AmountOutOfRange(ValueError):
+    pass
+
+
 def to_minor(value: float | int | str | Decimal, multiplier: int = 1) -> int:
     """Printed value x unit multiplier -> integer minor units, banker's rounding."""
     d = value if isinstance(value, Decimal) else Decimal(str(value))
     if not d.is_finite():
         raise ValueError(f"Non-finite monetary value: {value!r}")
-    return int((d * multiplier * MINOR_PER_UNIT).quantize(Decimal(1), rounding=ROUND_HALF_EVEN))
+    minor = int((d * multiplier * MINOR_PER_UNIT).quantize(Decimal(1), rounding=ROUND_HALF_EVEN))
+    if abs(minor) > MAX_MINOR:
+        raise AmountOutOfRange(f"{value} x {multiplier} exceeds the largest supported amount "
+                               f"({MAX_MINOR} minor units)")
+    return minor
 
 
 def format_minor(minor: int, currency: str | None = None) -> str:

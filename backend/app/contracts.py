@@ -140,7 +140,9 @@ class Evidence(StrEnum):
     verified = "verified"  # quote found in the cited page/sheet and contains the value
     no_source = "no_source"  # a value with no quote at all
     quote_not_found = "quote_not_found"
-    value_not_in_quote = "value_not_in_quote"
+    value_not_in_quote = "value_not_in_quote"  # number absent from the quote, or printed with the other sign
+    ambiguous = "ambiguous"  # quote names no line item, or holds several figures
+    not_checked = "not_checked"  # saved before evidence checks existed (migration 4)
 
 
 class Severity(StrEnum):

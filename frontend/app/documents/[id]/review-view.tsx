@@ -5,21 +5,15 @@ import { useParams } from "next/navigation";
 import { useId, useState } from "react";
 import { api, ApiError, errorMessage } from "@/lib/api";
 import {
-  AcceptFlagged, ReviewAction, type DocumentDetail, type Evidence, type ExtractedField, type ValidationIssue,
+  AcceptIssues, ReviewAction, type DocumentDetail, type ExtractedField, type ValidationIssue,
 } from "@/lib/contracts";
 import { formatMinor, minorToInput, parseMoneyToMinor } from "@/lib/money";
-import { suggestedCorrection } from "@/lib/review";
+import { evidenceProblem, needsJustification, suggestedCorrection } from "@/lib/review";
 import {
   Badge, Button, ErrorNote, FIELD_LABELS, FOCUS_RING, INPUT_CLASS, Panel, StatusBadge, TableScroll, usePolled,
 } from "@/components/ui";
 
 const SOURCE_PANEL_ID = "source-evidence";
-
-const EVIDENCE_PROBLEM: Record<Exclude<Evidence, "verified">, string> = {
-  no_source: "No source text was quoted for this value.",
-  quote_not_found: "The quoted text was not found on the cited page. Check the original before approving.",
-  value_not_in_quote: "The quoted text does not contain this figure. Check the original before approving.",
-};
 
 export function ReviewView() {
   const { id } = useParams<{ id: string }>();
@@ -189,7 +183,8 @@ function FieldRow({ field, label, currency, active, issues, busy, readOnly, onSe
   field: ExtractedField; label: string; currency: string | null; active: boolean; issues: ValidationIssue[];
   busy: boolean; readOnly: boolean; onSelect: () => void; onAct: (a: ReviewAction) => Promise<boolean>;
 }) {
-  // "correct" enters a new value; "accept" approves a flagged value as printed, which needs a note.
+  // "correct" enters a new value; "accept" approves the value as printed despite its
+  // open issues, which needs a note.
   const [mode, setMode] = useState<"correct" | "accept" | null>(null);
   const suggestion = suggestedCorrection(field, issues);
   const [value, setValue] = useState("");
@@ -198,6 +193,8 @@ function FieldRow({ field, label, currency, active, issues, busy, readOnly, onSe
   const ids = { value: useId(), note: useId(), err: useId(), hint: useId() };
   const reviewed = field.status === "approved" || field.status === "corrected";
   const flagged = field.status === "flagged";
+  const needsNote = needsJustification(issues);
+  const sourceProblem = evidenceProblem(field);
 
   function open(next: "correct" | "accept") {
     setValue(minorToInput(suggestion?.minor ?? field.value_minor));
@@ -211,7 +208,7 @@ function FieldRow({ field, label, currency, active, issues, busy, readOnly, onSe
     e.preventDefault();
     let action: ReviewAction;
     if (mode === "accept") {
-      const parsed = AcceptFlagged.safeParse({ action: "approve", note, expected_version: field.version });
+      const parsed = AcceptIssues.safeParse({ action: "approve", note, expected_version: field.version });
       if (!parsed.success) return setErr(parsed.error.issues[0].message);
       action = parsed.data;
     } else {
@@ -227,7 +224,7 @@ function FieldRow({ field, label, currency, active, issues, busy, readOnly, onSe
   }
 
   const hint = mode === "accept"
-    ? "Approving a flagged value accepts its validation issue. Your note appears in the report's audit trail."
+    ? "Approving this value accepts its open validation issues. Your note appears in the report's audit trail."
     : suggestion?.source === "calculated"
       ? "Pre-filled with the calculated value. Verify it against the source before saving."
       : suggestion?.source === "other_document"
@@ -246,9 +243,7 @@ function FieldRow({ field, label, currency, active, issues, busy, readOnly, onSe
           {field.status === "corrected" && (
             <div className="num text-xs text-stone-500">was {formatMinor(field.original_value_minor)}</div>
           )}
-          {field.evidence && field.evidence !== "verified" && !reviewed && (
-            <div className="text-xs text-amber-800">source not verified</div>
-          )}
+          {sourceProblem && <div className="text-xs text-amber-800">source not verified</div>}
         </th>
         <td className={`num px-2 py-2.5 text-right ${flagged ? "text-rose-700" : ""}`}>
           {formatMinor(field.value_minor, currency)}
@@ -258,13 +253,14 @@ function FieldRow({ field, label, currency, active, issues, busy, readOnly, onSe
         </td>
         <td className="px-2 py-2.5"><StatusBadge status={field.status} /></td>
         <td className="whitespace-nowrap px-4 py-2 text-right">
+          {!readOnly && needsNote && (
+            <Button variant="ghost" disabled={busy} onClick={() => open("accept")}
+              aria-label={field.value_minor === null ? `Acknowledge ${label} is missing` : `Accept ${label} as printed`}
+              aria-expanded={mode === "accept"}>{field.value_minor === null ? "Ack…" : "Accept…"}</Button>
+          )}
           {!readOnly && !reviewed && (
             <>
-              {flagged ? (
-                <Button variant="ghost" disabled={busy} onClick={() => open("accept")}
-                  aria-label={field.value_minor === null ? `Acknowledge ${label} is missing` : `Accept ${label} as printed`}
-                  aria-expanded={mode === "accept"}>{field.value_minor === null ? "Ack…" : "Accept…"}</Button>
-              ) : (
+              {!needsNote && (
                 <Button variant="ghost" disabled={busy}
                   onClick={() => onAct({ action: "approve", expected_version: field.version })}
                   aria-label={field.value_minor === null ? `Acknowledge ${label} is not in the document` : `Approve ${label}`}>
@@ -340,9 +336,9 @@ function SourcePanel({ doc, field }: { doc: DocumentDetail["document"]; field: E
               <b>{FIELD_LABELS[field.name] ?? field.name}</b>
               {location && <Badge>{location}</Badge>}
             </div>
-            {field.evidence && field.evidence !== "verified" && (
+            {evidenceProblem(field) && (
               <p className="mt-2 rounded bg-amber-50 px-3 py-2 text-xs text-amber-900 ring-1 ring-amber-300">
-                {EVIDENCE_PROBLEM[field.evidence]}
+                {evidenceProblem(field)}
               </p>
             )}
             {field.quote ? (

@@ -229,7 +229,60 @@ SCHEMA_V3 = [
         ON documents {_EXCLUSION_NEEDS_REASON}""",
 ]
 
-MIGRATIONS: list[tuple[int, str | list[str]]] = [(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3)]
+# Migration 4:
+# - issue_acceptances records which analyst review accepted which validation
+#   issue, per field. An issue counts as resolved only when every field in it has
+#   an acceptance for that exact issue (rule, fields, expected, actual), so an
+#   issue that first appears after its fields were reviewed stays open instead of
+#   being accepted implicitly. Issues resolved under the old rule carry over with
+#   review_id = the field's latest review (or NULL if it has none).
+# - Two new evidence states; values saved before evidence checks existed are
+#   marked not_checked instead of passing as verified (pipeline.backfill_evidence
+#   then runs the check where the stored file is readable). SQLite cannot alter a
+#   column's CHECK, so the column is rebuilt (add, copy, drop, rename).
+# - Amount bounds (MAX_MINOR = 2^53 - 1) enforced on fields.
+_MAX_MINOR_SQL = "9007199254740991"
+_FIELD_AMOUNT_BOUND = f"""
+    WHEN abs(NEW.value_minor) > {_MAX_MINOR_SQL} OR abs(NEW.original_value_minor) > {_MAX_MINOR_SQL}
+    BEGIN SELECT RAISE(ABORT, 'Amount exceeds the supported range'); END"""
+SCHEMA_V4 = [
+    """CREATE TABLE issue_acceptances (
+        id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL REFERENCES documents(id),
+        field TEXT NOT NULL,
+        rule TEXT NOT NULL,
+        fields TEXT NOT NULL,
+        expected_minor INTEGER,
+        actual_minor INTEGER,
+        review_id TEXT REFERENCES reviews(id),
+        created_at TEXT NOT NULL
+    )""",
+    """CREATE UNIQUE INDEX issue_acceptances_key ON issue_acceptances
+        (document_id, field, rule, fields, coalesce(expected_minor, 'null'), coalesce(actual_minor, 'null'))""",
+    """INSERT OR IGNORE INTO issue_acceptances
+           (id, document_id, field, rule, fields, expected_minor, actual_minor, review_id, created_at)
+       SELECT 'acc_' || lower(hex(randomblob(6))), vi.document_id, je.value, vi.rule, vi.fields,
+              vi.expected_minor, vi.actual_minor,
+              (SELECT r.id FROM reviews r JOIN fields f ON f.id = r.field_id
+                WHERE f.document_id = vi.document_id AND f.name = je.value
+                ORDER BY r.created_at DESC LIMIT 1),
+              vi.created_at
+       FROM validation_issues vi, json_each(vi.fields) je
+       WHERE vi.resolved = 1 AND vi.document_id IS NOT NULL""",
+    """ALTER TABLE fields ADD COLUMN evidence_v4 TEXT CHECK (evidence_v4 IS NULL OR evidence_v4 IN
+       ('verified', 'no_source', 'quote_not_found', 'value_not_in_quote', 'ambiguous', 'not_checked'))""",
+    """UPDATE fields SET evidence_v4 = CASE
+           WHEN value_minor IS NOT NULL AND evidence IS NULL THEN 'not_checked' ELSE evidence END""",
+    "ALTER TABLE fields DROP COLUMN evidence",
+    "ALTER TABLE fields RENAME COLUMN evidence_v4 TO evidence",
+    f"CREATE TRIGGER fields_amount_bound_insert BEFORE INSERT ON fields {_FIELD_AMOUNT_BOUND}",
+    f"""CREATE TRIGGER fields_amount_bound_update BEFORE UPDATE OF value_minor, original_value_minor
+        ON fields {_FIELD_AMOUNT_BOUND}""",
+]
+
+MIGRATIONS: list[tuple[int, str | list[str]]] = [
+    (1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3), (4, SCHEMA_V4),
+]
 
 
 def now() -> datetime:

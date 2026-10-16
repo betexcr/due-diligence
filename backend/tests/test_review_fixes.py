@@ -56,9 +56,10 @@ def test_flagged_values_cannot_be_approved_without_a_note(client, samples):
 
     for f in flagged:
         url = f"/api/fields/{f['id']}/review"
-        assert client.post(url, json={"action": "approve", "expected_version": f["version"]}).status_code == 422
+        # 409, not 422: whether a note is needed depends on the field's current state.
+        assert client.post(url, json={"action": "approve", "expected_version": f["version"]}).status_code == 409
         assert client.post(url, json={"action": "approve", "expected_version": f["version"],
-                                      "note": "   "}).status_code == 422
+                                      "note": "   "}).status_code == 409
     assert client.post(f"/api/documents/{doc}/approve-all").status_code == 200
     ready, blockers = readiness(pid)
     assert not ready and any("unresolved validation error" in b for b in blockers)
@@ -175,7 +176,7 @@ def test_migration_3_backfills_blank_exclusion_reasons(tmp_path):
     conn.execute("""INSERT INTO documents (id, project_id, file_name, content_type, size_bytes, sha256,
                     storage_path, status, created_at, excluded_at, excluded_reason)
                     VALUES ('d1', 'p1', 'a', 't', 1, 'h', '/x', 'failed', 't', '2026-01-02', '')""")
-    assert db.migrate(conn) == 3
+    assert db.migrate(conn, target=3) == 3
     assert conn.execute("SELECT excluded_reason FROM documents").fetchone()[0] == "(no reason recorded)"
     assert "evidence" in [c[1] for c in conn.execute("PRAGMA table_info(fields)")]
 

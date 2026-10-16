@@ -7,7 +7,9 @@ export const DocumentStatus = z.enum(["uploaded", "processing", "needs_review", 
 export const JobStatus = z.enum(["queued", "running", "succeeded", "dead"]);
 export const FieldStatus = z.enum(["extracted", "flagged", "missing", "approved", "corrected"]);
 export const Severity = z.enum(["error", "warning", "info"]);
-export const Evidence = z.enum(["verified", "no_source", "quote_not_found", "value_not_in_quote"]);
+export const Evidence = z.enum([
+  "verified", "no_source", "quote_not_found", "value_not_in_quote", "ambiguous", "not_checked",
+]);
 
 // Mirrors backend/app/money.py MAX_MINOR: the largest amount that is exact as a JS number.
 export const MAX_MINOR = Number.MAX_SAFE_INTEGER;
@@ -149,8 +151,9 @@ export const ReviewAction = z.discriminatedUnion("action", [
   }),
 ]);
 
-// Approving a flagged value accepts its validation issue, so the API requires a note.
-export const AcceptFlagged = z.object({
+// Approving a value with open validation issues (a flagged value, or a reviewed one
+// caught up in a new issue) accepts them, so the API requires a note.
+export const AcceptIssues = z.object({
   action: z.literal("approve"),
   expected_version: z.number().int().min(1),
   note: z.string().trim().min(1, "Explain why the value is right as printed").max(1000),

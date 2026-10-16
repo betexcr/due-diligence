@@ -56,7 +56,7 @@ def _legacy_db(path):
 
 def test_migration_from_v1_converts_money_and_preserves_rows(tmp_path):
     conn = _legacy_db(tmp_path / "legacy.sqlite3")
-    assert db.migrate(conn) == 3
+    assert db.migrate(conn) == 4
     f = conn.execute("SELECT * FROM fields WHERE id = 'f1'").fetchone()
     assert f["value_minor"] == 12_500_000_00 and f["version"] == 1 and f["status"] == "corrected"
     assert conn.execute("SELECT value_minor FROM fields WHERE id = 'f2'").fetchone()[0] is None
@@ -65,7 +65,7 @@ def test_migration_from_v1_converts_money_and_preserves_rows(tmp_path):
     r = conn.execute("SELECT old_value_minor, new_value_minor, note FROM reviews").fetchone()
     assert (r[0], r[1], r[2]) == (4_500_000_00, 3_500_000_00, "typo")
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
-    assert db.migrate(conn) == 3  # idempotent
+    assert db.migrate(conn) == 4  # idempotent
 
 
 def test_schema_enforces_invariants(fresh_db):

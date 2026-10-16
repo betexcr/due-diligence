@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtractedField, ValidationIssue } from "./contracts.ts";
-import { suggestedCorrection } from "./review.ts";
+import { evidenceProblem, needsJustification, suggestedCorrection } from "./review.ts";
 
 const field = (name: string): ExtractedField => ({
   id: `f-${name}`, document_id: "d1", name, value_minor: 1, original_value_minor: 1, page: 2, sheet: null,
@@ -37,4 +37,20 @@ test("a conflicting figure in another document is suggested as such", () => {
 test("resolved issues and other documents' issues suggest nothing", () => {
   assert.equal(suggestedCorrection(field("operating_income"), [{ ...opIncome, resolved: true }]), null);
   assert.equal(suggestedCorrection(field("operating_income"), [{ ...opIncome, document_id: "d2" }]), null);
+});
+
+test("approving needs a note while any open error or warning involves the field", () => {
+  assert.equal(needsJustification([opIncome]), true);
+  assert.equal(needsJustification([issue("x", ["revenue"], null, { severity: "warning" })]), true);
+  assert.equal(needsJustification([{ ...opIncome, resolved: true }]), false);
+  assert.equal(needsJustification([issue("x", ["revenue"], null, { severity: "info" })]), false);
+  assert.equal(needsJustification([]), false);
+});
+
+test("evidence problems fail closed and ignore analyst-entered values", () => {
+  assert.equal(evidenceProblem(field("revenue")), null);
+  assert.match(evidenceProblem({ ...field("revenue"), evidence: "ambiguous" }) ?? "", /unambiguously/);
+  assert.match(evidenceProblem({ ...field("revenue"), evidence: null }) ?? "", /never verified/);
+  assert.equal(evidenceProblem({ ...field("revenue"), evidence: "quote_not_found", status: "corrected" }), null);
+  assert.equal(evidenceProblem({ ...field("revenue"), evidence: null, value_minor: null }), null);
 });
