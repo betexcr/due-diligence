@@ -1,0 +1,25 @@
+[project]
+name = "dd-backend"
+version = "0.1.0"
+description = "AI-assisted investment due diligence: extraction, validation, review"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=1.15.0",
+    "fastapi>=0.143.2",
+    "openpyxl>=3.1.5",
+    "pydantic>=2.14.1",
+    "pypdf>=6.20.1",
+    "python-multipart>=0.0.32",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "reportlab>=5.0.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
