@@ -73,4 +73,6 @@ def row_to_document(row) -> Document:
         content_type=row["content_type"], size_bytes=row["size_bytes"], sha256=row["sha256"],
         status=row["status"], error=row["error"], created_at=row["created_at"],
         fiscal_year=row["fiscal_year"] if "fiscal_year" in row.keys() else None,
+        excluded=row["excluded_at"] is not None,
+        excluded_reason=row["excluded_reason"],
     )

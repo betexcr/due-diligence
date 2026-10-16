@@ -11,9 +11,12 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 PIPELINE_VERSION = "extract-v1"
+
+# Money in API and storage contracts is integer minor units (see app/money.py).
+# The LLM contract below is the one exception: it reports numbers as printed.
 
 
 class Strict(BaseModel):
@@ -160,6 +163,8 @@ class Document(BaseModel):
     fiscal_year: int | None = None
     error: str | None = None
     created_at: datetime
+    excluded: bool = False
+    excluded_reason: str | None = None
 
 
 class UploadResult(BaseModel):
@@ -186,14 +191,15 @@ class ExtractedField(BaseModel):
     id: str
     document_id: str
     name: str
-    value: float | None
-    original_value: float | None
+    value_minor: int | None = Field(..., description="Integer hundredths of the currency unit")
+    original_value_minor: int | None
     page: int | None
     sheet: str | None
     cell: str | None
     quote: str | None
     confidence: float
     status: FieldStatus
+    version: int = Field(..., ge=1, description="Optimistic concurrency token; send back on review")
 
 
 class ValidationIssue(BaseModel):
@@ -204,15 +210,31 @@ class ValidationIssue(BaseModel):
     severity: Severity
     message: str
     fields: list[str]
-    expected: float | None = None
-    actual: float | None = None
+    expected_minor: int | None = None
+    actual_minor: int | None = None
     resolved: bool = False
 
 
 class ReviewAction(Strict):
     action: Literal["approve", "correct"]
-    value: float | None = None
+    value_minor: int | None = Field(None, description="Required for 'correct'")
     note: str | None = Field(None, max_length=1000)
+    expected_version: int = Field(..., ge=1, description="The field version the reviewer saw")
+    # TODO(auth): replace with the authenticated user's identity.
+    reviewer: str = Field("analyst", min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def _correction_is_complete(self) -> "ReviewAction":
+        if self.action == "correct":
+            if self.value_minor is None:
+                raise ValueError("A correction needs a value")
+            if not (self.note and self.note.strip()):
+                raise ValueError("A correction needs a note explaining the source of the new value")
+        return self
+
+
+class DocumentExclusion(Strict):
+    reason: str = Field(..., min_length=1, max_length=500)
     reviewer: str = Field("analyst", min_length=1, max_length=100)
 
 
@@ -220,8 +242,8 @@ class Review(BaseModel):
     id: str
     field_id: str
     action: str
-    old_value: float | None
-    new_value: float | None
+    old_value_minor: int | None
+    new_value_minor: int | None
     note: str | None
     reviewer: str
     created_at: datetime

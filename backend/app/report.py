@@ -12,6 +12,7 @@ import html
 import json
 
 from .db import connect, iso
+from .money import format_minor
 
 FIELD_LABELS = {
     "revenue": "Revenue",
@@ -32,15 +33,15 @@ def readiness(project_id: str) -> tuple[bool, list[str]]:
     """Ready when every document processed, no open errors, and every field reviewed."""
     blockers = []
     with connect() as conn:
-        docs = conn.execute("SELECT id, file_name, status FROM documents WHERE project_id = ?",
-                            (project_id,)).fetchall()
+        docs = conn.execute("SELECT id, file_name, status FROM documents WHERE project_id = ? "
+                            "AND excluded_at IS NULL", (project_id,)).fetchall()
         if not docs:
             blockers.append("No documents uploaded")
         for d in docs:
             if d["status"] in ("uploaded", "processing"):
                 blockers.append(f"{d['file_name']} is still processing")
             elif d["status"] == "failed":
-                blockers.append(f"{d['file_name']} failed processing (see dead-letter queue)")
+                blockers.append(f"{d['file_name']} failed processing (requeue it, or exclude it with a reason)")
         open_errors = conn.execute(
             "SELECT COUNT(*) FROM validation_issues WHERE project_id = ? AND resolved = 0 AND severity = 'error'",
             (project_id,)).fetchone()[0]
@@ -48,19 +49,16 @@ def readiness(project_id: str) -> tuple[bool, list[str]]:
             blockers.append(f"{open_errors} unresolved validation error(s)")
         unreviewed = conn.execute(
             """SELECT COUNT(*) FROM fields f JOIN documents d ON d.id = f.document_id
-               WHERE d.project_id = ? AND f.value IS NOT NULL AND f.status NOT IN ('approved', 'corrected')""",
+               WHERE d.project_id = ? AND d.excluded_at IS NULL AND f.value_minor IS NOT NULL
+                 AND f.status NOT IN ('approved', 'corrected')""",
             (project_id,)).fetchone()[0]
         if unreviewed:
             blockers.append(f"{unreviewed} extracted value(s) awaiting analyst approval")
     return not blockers, blockers
 
 
-def _money(v: float | None, currency: str | None) -> str:
-    if v is None:
-        return "n/a"
-    s = f"{abs(v):,.0f}"
-    s = f"({s})" if v < 0 else s
-    return f"{currency or ''} {s}".strip()
+def _money(v: int | None, currency: str | None) -> str:
+    return "n/a" if v is None else format_minor(v, currency)
 
 
 def build_report(project_id: str) -> dict:
@@ -70,7 +68,11 @@ def build_report(project_id: str) -> dict:
         periods = conn.execute(
             """SELECT d.id, d.file_name, e.fiscal_year, e.currency, e.reporting_period_end
                FROM documents d JOIN extractions e ON e.document_id = d.id
-               WHERE d.project_id = ? ORDER BY e.fiscal_year""", (project_id,)).fetchall()
+               WHERE d.project_id = ? AND d.excluded_at IS NULL ORDER BY e.fiscal_year""",
+            (project_id,)).fetchall()
+        excluded = conn.execute(
+            """SELECT file_name, excluded_reason, excluded_by, excluded_at FROM documents
+               WHERE project_id = ? AND excluded_at IS NOT NULL ORDER BY excluded_at""", (project_id,)).fetchall()
         fields = {}
         for p in periods:
             for f in conn.execute("SELECT * FROM fields WHERE document_id = ?", (p["id"],)):
@@ -93,14 +95,14 @@ def build_report(project_id: str) -> dict:
             if f is not None and approved:
                 src = f"{p['file_name']}" + (f" p.{f['page']}" if f["page"] else "") + \
                       (f" {f['sheet']}!{f['cell']}" if f["sheet"] and f["cell"] else "")
-            if f is None or (f["value"] is None and f["status"] in ("missing", "approved")):
+            if f is None or (f["value_minor"] is None and f["status"] in ("missing", "approved")):
                 display = "—"  # not stated in this document
             elif approved:
-                display = _money(f["value"], p["currency"])
+                display = _money(f["value_minor"], p["currency"])
             else:
                 display = "not approved"
             cells.append({
-                "value": f["value"] if approved else None,
+                "value_minor": f["value_minor"] if approved else None,
                 "display": display,
                 "corrected": approved and f["status"] == "corrected",
                 "source": src,
@@ -117,8 +119,11 @@ def build_report(project_id: str) -> dict:
         "rows": rows,
         "issues": [{"rule": i["rule"], "severity": i["severity"], "message": i["message"],
                     "resolved": bool(i["resolved"]), "fields": json.loads(i["fields"])} for i in issues],
+        "excluded_documents": [{"file_name": x["file_name"], "reason": x["excluded_reason"],
+                                "by": x["excluded_by"], "at": x["excluded_at"]} for x in excluded],
         "audit_trail": [{"field": r["field_name"], "file_name": r["file_name"], "action": r["action"],
-                         "old_value": r["old_value"], "new_value": r["new_value"], "note": r["note"],
+                         "old_value_minor": r["old_value_minor"], "new_value_minor": r["new_value_minor"],
+                         "note": r["note"],
                          "reviewer": r["reviewer"], "at": r["created_at"]} for r in reviews],
     }
 
@@ -140,6 +145,9 @@ def render_html(report: dict) -> str:
     audit = "".join(
         f"<li>{e(a['at'][:19])} {e(a['reviewer'])} {e(a['action'])} {e(a['field'])} in {e(a['file_name'])}"
         f"{': ' + e(a['note']) if a['note'] else ''}</li>" for a in report["audit_trail"]) or "<li>None</li>"
+    excluded = "".join(
+        f"<li>{e(x['file_name'])}: {e(x['reason'])} ({e(x['by'])}, {e(x['at'][:19])})</li>"
+        for x in report["excluded_documents"]) or "<li>None</li>"
     status = "APPROVED DATA" if report["ready"] else "DRAFT: " + "; ".join(report["blockers"])
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Due diligence: {e(report['project']['company_name'])}</title>
@@ -152,4 +160,5 @@ small{{color:#666}}.status{{padding:8px;background:#f4f4f4;border-left:4px solid
 <h2>Financial summary</h2><table><tr><th>Line item</th>{head}</tr>{body}</table>
 <p><small>* corrected by analyst. Only analyst-approved values are shown.</small></p>
 <h2>Findings and validation issues</h2><ul>{issues}</ul>
+<h2>Excluded documents</h2><ul>{excluded}</ul>
 <h2>Audit trail</h2><ul>{audit}</ul></body></html>"""

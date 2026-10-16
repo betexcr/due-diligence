@@ -28,6 +28,8 @@ export const Document = z.object({
   fiscal_year: z.number().int().nullable(),
   error: z.string().nullable(),
   created_at: z.string(),
+  excluded: z.boolean(),
+  excluded_reason: z.string().nullable(),
 });
 
 export const Job = z.object({
@@ -59,14 +61,16 @@ export const ExtractedField = z.object({
   id: z.string(),
   document_id: z.string(),
   name: z.string(),
-  value: z.number().nullable(),
-  original_value: z.number().nullable(),
+  // Money is integer minor units (hundredths of the currency unit), see lib/money.ts.
+  value_minor: z.number().int().nullable(),
+  original_value_minor: z.number().int().nullable(),
   page: z.number().int().nullable(),
   sheet: z.string().nullable(),
   cell: z.string().nullable(),
   quote: z.string().nullable(),
   confidence: z.number().min(0).max(1),
   status: FieldStatus,
+  version: z.number().int().min(1),
 });
 
 export const ValidationIssue = z.object({
@@ -77,8 +81,8 @@ export const ValidationIssue = z.object({
   severity: Severity,
   message: z.string(),
   fields: z.array(z.string()),
-  expected: z.number().nullable(),
-  actual: z.number().nullable(),
+  expected_minor: z.number().int().nullable(),
+  actual_minor: z.number().int().nullable(),
   resolved: z.boolean(),
 });
 
@@ -86,8 +90,8 @@ export const Review = z.object({
   id: z.string(),
   field_id: z.string(),
   action: z.string(),
-  old_value: z.number().nullable(),
-  new_value: z.number().nullable(),
+  old_value_minor: z.number().int().nullable(),
+  new_value_minor: z.number().int().nullable(),
   note: z.string().nullable(),
   reviewer: z.string(),
   created_at: z.string(),
@@ -127,13 +131,22 @@ export const ProjectCreate = z.object({
 });
 
 export const ReviewAction = z.discriminatedUnion("action", [
-  z.object({ action: z.literal("approve"), note: z.string().max(1000).optional() }),
+  z.object({
+    action: z.literal("approve"),
+    expected_version: z.number().int().min(1),
+    note: z.string().max(1000).optional(),
+  }),
   z.object({
     action: z.literal("correct"),
-    value: z.number({ error: "Enter a number" }).finite(),
+    expected_version: z.number().int().min(1),
+    value_minor: z.number().int({ error: "Enter an amount" }),
     note: z.string().trim().min(1, "Explain where the corrected value comes from").max(1000),
   }),
 ]);
+
+export const DocumentExclusion = z.object({
+  reason: z.string().trim().min(1, "Give a reason; it is shown in the report").max(500),
+});
 
 export type Project = z.infer<typeof Project>;
 export type Document = z.infer<typeof Document>;

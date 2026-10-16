@@ -15,6 +15,8 @@ from .config import settings
 from .contracts import (
     Document,
     DocumentDetail,
+    DocumentExclusion,
+    DocumentStatus,
     ExtractedField,
     FieldStatus,
     Job,
@@ -28,7 +30,7 @@ from .contracts import (
 )
 from .db import connect, init_db, iso, new_id, transaction
 from .ingestion import IngestionError, ingest
-from .pipeline import revalidate_project
+from .pipeline import revalidate
 from .report import build_report, readiness, render_html
 from .worker import WorkerPool
 
@@ -61,7 +63,9 @@ JOB_SELECT = """SELECT j.*, d.file_name FROM jobs j JOIN documents d ON d.id = j
 
 
 def _doc(r) -> Document:
-    return Document(**{k: r[k] for k in Document.model_fields if k in r.keys()})
+    data = {k: r[k] for k in Document.model_fields if k in r.keys()}
+    data["excluded"] = r["excluded_at"] is not None
+    return Document(**data)
 
 
 def _job(r) -> Job:
@@ -78,7 +82,7 @@ def _field(r) -> ExtractedField:
 
 def _project(conn, r) -> Project:
     counts = conn.execute(
-        """SELECT (SELECT COUNT(*) FROM documents WHERE project_id = ?) AS docs,
+        """SELECT (SELECT COUNT(*) FROM documents WHERE project_id = ? AND excluded_at IS NULL) AS docs,
                   (SELECT COUNT(*) FROM validation_issues WHERE project_id = ? AND resolved = 0
                      AND severity IN ('error','warning')) AS issues""",
         (r["id"], r["id"])).fetchone()
@@ -173,28 +177,47 @@ def get_document_file(document_id: str) -> FileResponse:
                         content_disposition_type="inline")
 
 
+class Conflict(HTTPException):
+    def __init__(self, detail: str) -> None:
+        super().__init__(409, detail)
+
+
+def _active_document(conn, document_id: str):
+    d = conn.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
+    if d is None:
+        raise HTTPException(404, "Document not found")
+    if d["excluded_at"] is not None:
+        raise Conflict("Document is excluded from the project; restore it first")
+    return d
+
+
+def _record_review(conn, field, action: str, new_value: int | None, note: str | None, reviewer: str) -> None:
+    status = FieldStatus.corrected if action == "correct" else FieldStatus.approved
+    # Compare-and-set on version: a concurrent review or a reprocessing run that
+    # changed the field since the reviewer loaded it makes this a no-op.
+    cur = conn.execute(
+        "UPDATE fields SET value_minor = ?, status = ?, version = version + 1 WHERE id = ? AND version = ?",
+        (new_value, status, field["id"], field["version"]))
+    if cur.rowcount != 1:
+        raise Conflict("This value changed since you loaded it. Reload and review again.")
+    conn.execute(
+        """INSERT INTO reviews (id, field_id, action, old_value_minor, new_value_minor, note, reviewer, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (new_id("rev"), field["id"], action, field["value_minor"], new_value, note, reviewer, iso()))
+
+
 @app.post("/api/fields/{field_id}/review", response_model=ExtractedField)
 def review_field(field_id: str, body: ReviewAction) -> ExtractedField:
-    if body.action == "correct" and body.value is None:
-        raise HTTPException(422, "A correction needs a value")
-    if body.action == "correct" and not (body.note and body.note.strip()):
-        raise HTTPException(422, "A correction needs a note explaining the source of the new value")
     with transaction() as conn:
-        f = conn.execute(
-            "SELECT f.*, d.project_id FROM fields f JOIN documents d ON d.id = f.document_id WHERE f.id = ?",
-            (field_id,)).fetchone()
+        f = conn.execute("SELECT * FROM fields WHERE id = ?", (field_id,)).fetchone()
         if f is None:
             raise HTTPException(404, "Field not found")
-        new_value = body.value if body.action == "correct" else f["value"]
-        status = FieldStatus.corrected if body.action == "correct" else FieldStatus.approved
-        conn.execute("UPDATE fields SET value = ?, status = ? WHERE id = ?", (new_value, status, field_id))
-        conn.execute(
-            """INSERT INTO reviews (id, field_id, action, old_value, new_value, note, reviewer, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (new_id("rev"), field_id, body.action, f["value"], new_value, body.note, body.reviewer, iso()))
-        project_id = f["project_id"]
-    revalidate_project(project_id)
-    with connect() as conn:
+        d = _active_document(conn, f["document_id"])
+        if f["version"] != body.expected_version:
+            raise Conflict("This value changed since you loaded it. Reload and review again.")
+        new_value = body.value_minor if body.action == "correct" else f["value_minor"]
+        _record_review(conn, f, body.action, new_value, body.note, body.reviewer)
+        revalidate(conn, d["project_id"])
         return _field(conn.execute("SELECT * FROM fields WHERE id = ?", (field_id,)).fetchone())
 
 
@@ -202,19 +225,41 @@ def review_field(field_id: str, body: ReviewAction) -> ExtractedField:
 def approve_all_clean(document_id: str) -> DocumentDetail:
     """Bulk-approve values that passed every check. Flagged values still need individual review."""
     with transaction() as conn:
-        d = conn.execute("SELECT project_id FROM documents WHERE id = ?", (document_id,)).fetchone()
-        if d is None:
-            raise HTTPException(404, "Document not found")
+        d = _active_document(conn, document_id)
         rows = conn.execute("SELECT * FROM fields WHERE document_id = ? AND status = 'extracted'",
                             (document_id,)).fetchall()
         for f in rows:
-            conn.execute("UPDATE fields SET status = 'approved' WHERE id = ?", (f["id"],))
-            conn.execute(
-                """INSERT INTO reviews (id, field_id, action, old_value, new_value, note, reviewer, created_at)
-                   VALUES (?, ?, 'approve', ?, ?, 'bulk approve: passed all checks', 'analyst', ?)""",
-                (new_id("rev"), f["id"], f["value"], f["value"], iso()))
-    revalidate_project(d["project_id"])
+            _record_review(conn, f, "approve", f["value_minor"], "bulk approve: passed all checks", "analyst")
+        revalidate(conn, d["project_id"])
     return get_document(document_id)
+
+
+@app.post("/api/documents/{document_id}/exclude", response_model=Document)
+def exclude_document(document_id: str, body: DocumentExclusion) -> Document:
+    """Take a document out of validation and the report (e.g. an unreadable duplicate).
+    Reversible, and the reason is kept for the report's provenance section."""
+    with transaction() as conn:
+        d = _active_document(conn, document_id)
+        if d["status"] in (DocumentStatus.uploaded, DocumentStatus.processing):
+            raise Conflict("Document is still being processed; wait for it to finish or fail")
+        conn.execute("UPDATE documents SET excluded_at = ?, excluded_reason = ?, excluded_by = ? WHERE id = ?",
+                     (iso(), body.reason.strip(), body.reviewer, document_id))
+        revalidate(conn, d["project_id"])
+        return _doc(conn.execute(f"{DOC_SELECT} WHERE d.id = ?", (document_id,)).fetchone())
+
+
+@app.post("/api/documents/{document_id}/restore", response_model=Document)
+def restore_document(document_id: str) -> Document:
+    with transaction() as conn:
+        d = conn.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
+        if d is None:
+            raise HTTPException(404, "Document not found")
+        if d["excluded_at"] is None:
+            raise Conflict("Document is not excluded")
+        conn.execute("UPDATE documents SET excluded_at = NULL, excluded_reason = NULL, excluded_by = NULL "
+                     "WHERE id = ?", (document_id,))
+        revalidate(conn, d["project_id"])
+        return _doc(conn.execute(f"{DOC_SELECT} WHERE d.id = ?", (document_id,)).fetchone())
 
 
 # --- Jobs / DLQ --------------------------------------------------------------
@@ -238,12 +283,15 @@ def job_attempts(job_id: str) -> list[dict]:
 
 @app.post("/api/jobs/{job_id}/requeue", response_model=Job)
 def requeue(job_id: str) -> Job:
-    if not jobs.requeue_dead(job_id):
-        raise HTTPException(409, "Only dead-lettered jobs can be requeued")
     with transaction() as conn:
         j = conn.execute(f"{JOB_SELECT} WHERE j.id = ?", (job_id,)).fetchone()
+        if j is None:
+            raise HTTPException(404, "Job not found")
+        _active_document(conn, j["document_id"])
+        if not jobs.requeue_dead(conn, job_id):
+            raise Conflict("Only dead-lettered jobs can be requeued")
         conn.execute("UPDATE documents SET status = 'uploaded', error = NULL WHERE id = ?", (j["document_id"],))
-        return _job(j)
+        return _job(conn.execute(f"{JOB_SELECT} WHERE j.id = ?", (job_id,)).fetchone())
 
 
 # --- Report ------------------------------------------------------------------

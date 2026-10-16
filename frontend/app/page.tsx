@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useState } from "react";
 import { api } from "@/lib/api";
 import { ProjectCreate, type Project } from "@/lib/contracts";
-import { Badge, Button, ErrorNote, Panel, usePolled } from "@/components/ui";
+import { Badge, Button, ErrorNote, FOCUS_RING, INPUT_CLASS, Panel, usePolled } from "@/components/ui";
 
 export default function ProjectsPage() {
   const { data: projects, error, refresh } = usePolled<Project[]>(api.projects, () => false);
@@ -33,13 +33,14 @@ export default function ProjectsPage() {
     <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
       <Panel title="Due diligence projects">
         <ErrorNote error={error} />
+        {!projects && !error && <p className="px-4 py-6 text-sm text-stone-500" role="status">Loading…</p>}
         {projects && projects.length === 0 && (
           <p className="px-4 py-8 text-sm text-stone-500">No projects yet. Create one to start uploading documents.</p>
         )}
         <ul className="divide-y divide-stone-200">
           {projects?.map((p) => (
             <li key={p.id}>
-              <Link href={`/projects/${p.id}`} className="flex items-center gap-4 px-4 py-3 hover:bg-stone-50">
+              <Link href={`/projects/${p.id}`} className={`flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-3 hover:bg-stone-50 ${FOCUS_RING}`}>
                 <div className="min-w-0 flex-1">
                   <div className="font-medium">{p.name}</div>
                   <div className="text-sm text-stone-500">{p.company_name}</div>
@@ -61,15 +62,17 @@ export default function ProjectsPage() {
           <label className="block text-sm">
             <span className="text-stone-600">Project</span>
             <input value={name} onChange={(e) => setName(e.target.value)}
-              className="mt-1 w-full rounded border border-stone-300 px-2 py-1.5" />
+              className={`mt-1 w-full ${INPUT_CLASS}`} />
           </label>
           <label className="block text-sm">
             <span className="text-stone-600">Target company</span>
             <input value={company} onChange={(e) => setCompany(e.target.value)}
-              className="mt-1 w-full rounded border border-stone-300 px-2 py-1.5" />
+              className={`mt-1 w-full ${INPUT_CLASS}`} />
           </label>
           <ErrorNote error={formError} />
-          <Button variant="primary" disabled={busy} className="w-full">Create project</Button>
+          <Button type="submit" variant="primary" disabled={busy} className="w-full">
+            {busy ? "Creating…" : "Create project"}
+          </Button>
         </form>
       </Panel>
     </div>

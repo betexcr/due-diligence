@@ -66,16 +66,26 @@ def test_due_diligence_workflow(client, samples):
     assert fields["operating_income"]["page"] == 2
     assert "4,500,000" in fields["operating_income"]["quote"]
     issue = next(i for i in detail["issues"] if i["rule"] == "operating_income_identity")
-    assert issue["expected"] == 3_500_000 and issue["actual"] == 4_500_000
+    assert issue["expected_minor"] == 3_500_000_00 and issue["actual_minor"] == 4_500_000_00
+    opinc = fields["operating_income"]
+    assert opinc["value_minor"] == 4_500_000_00 and isinstance(opinc["value_minor"], int)
 
-    # Corrections require a note.
-    r = client.post(f"/api/fields/{fields['operating_income']['id']}/review",
-                    json={"action": "correct", "value": 3_500_000})
-    assert r.status_code == 422
-    r = client.post(f"/api/fields/{fields['operating_income']['id']}/review",
-                    json={"action": "correct", "value": 3_500_000,
-                          "note": "Typo in statement; 7.5M - 4.0M confirmed with mgmt accounts"})
-    assert r.json()["status"] == "corrected" and r.json()["original_value"] == 4_500_000
+    # Corrections require a note, and the version the reviewer saw.
+    url = f"/api/fields/{opinc['id']}/review"
+    assert client.post(url, json={"action": "correct", "value_minor": 3_500_000_00,
+                                  "expected_version": opinc["version"]}).status_code == 422
+    assert client.post(url, json={"action": "correct", "value_minor": 3_500_000_00,
+                                  "note": "x"}).status_code == 422
+    r = client.post(url, json={"action": "correct", "value_minor": 3_500_000_00,
+                               "expected_version": opinc["version"],
+                               "note": "Typo in statement; 7.5M - 4.0M confirmed with mgmt accounts"})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "corrected" and r.json()["original_value_minor"] == 4_500_000_00
+    assert r.json()["version"] == opinc["version"] + 1
+
+    # A second reviewer working from the stale version is rejected, not silently applied.
+    stale = client.post(url, json={"action": "approve", "expected_version": opinc["version"]})
+    assert stale.status_code == 409
 
     # Correction fixes both the identity and the cross-document conflict.
     project = client.get(f"/api/projects/{pid}").json()
@@ -85,16 +95,26 @@ def test_due_diligence_workflow(client, samples):
     report = client.get(f"/api/projects/{pid}/report").json()
     assert any("failed processing" in b for b in report["blockers"])
 
-    # Operator fixes the DLQ'd document by removing it... here we approve everything else
-    # and check the remaining blocker is only the failed upload.
-    for doc_id in docs.values():
-        client.post(f"/api/documents/{doc_id}/approve-all")
+    for name, doc_id in docs.items():
+        if name != "corrupt_upload.pdf":
+            assert client.post(f"/api/documents/{doc_id}/approve-all").status_code == 200
     report = client.get(f"/api/projects/{pid}/report").json()
-    assert report["blockers"] == ["corrupt_upload.pdf failed processing (see dead-letter queue)"]
+    assert report["blockers"] == [
+        "corrupt_upload.pdf failed processing (requeue it, or exclude it with a reason)"]
+
+    # The analyst excludes the unreadable upload with a reason: the report becomes
+    # ready and records the exclusion.
+    r = client.post(f"/api/documents/{docs['corrupt_upload.pdf']}/exclude",
+                    json={"reason": "Corrupt duplicate; client re-sent statements as alpha_fs_2024.pdf"})
+    assert r.status_code == 200 and r.json()["excluded"] is True
+    report = client.get(f"/api/projects/{pid}/report").json()
+    assert report["ready"] is True and report["blockers"] == []
+    assert report["excluded_documents"][0]["file_name"] == "corrupt_upload.pdf"
+    assert client.get(f"/api/projects/{pid}").json()["report_ready"] is True
 
     fy24 = next(i for i, p in enumerate(report["periods"]) if p["file_name"] == "alpha_fs_2024.pdf")
     opinc = next(r for r in report["rows"] if r["field"] == "operating_income")["cells"][fy24]
-    assert opinc["value"] == 3_500_000 and opinc["corrected"]
+    assert opinc["value_minor"] == 3_500_000_00 and opinc["corrected"]
     assert any(a["action"] == "correct" for a in report["audit_trail"])
     assert "Alpha Manufacturing" in client.get(f"/api/projects/{pid}/report.html").text
 
@@ -106,10 +126,61 @@ def test_dead_letter_requeue_reprocesses(client, samples):
     assert client.post(f"/api/jobs/{up['job_id']}/requeue").status_code == 200
     assert client.post(f"/api/jobs/{up['job_id']}/requeue").status_code == 409  # no longer dead
     drain()
-    assert client.get(f"/api/jobs?status=dead").json()[0]["attempts"] == 1
+    assert client.get("/api/jobs?status=dead").json()[0]["attempts"] == 1
+
+    # A dead job for an excluded document can't be requeued until it is restored.
+    doc_id = up["document"]["id"]
+    assert client.post(f"/api/documents/{doc_id}/exclude", json={"reason": "junk"}).status_code == 200
+    assert client.post(f"/api/jobs/{up['job_id']}/requeue").status_code == 409
 
 
 def test_rejects_unsupported_upload(client):
     pid = client.post("/api/projects", json={"name": "P", "company_name": "Alpha"}).json()["id"]
     r = client.post(f"/api/projects/{pid}/documents", files={"file": ("x.exe", b"MZ\x90\x00", "application/x-msdownload")})
     assert r.status_code == 422
+
+
+def test_exclusion_rules(client, samples):
+    pid = client.post("/api/projects", json={"name": "P", "company_name": "Alpha Manufacturing Inc."}).json()["id"]
+    fs24 = upload(client, pid, samples / "alpha_fs_2024.pdf")["document"]["id"]
+    xlsx = upload(client, pid, samples / "alpha_mgmt_accounts_2024.xlsx")["document"]["id"]
+
+    # Not while it is still in flight.
+    assert client.post(f"/api/documents/{fs24}/exclude", json={"reason": "dup"}).status_code == 409
+    drain()
+
+    def open_rules():
+        issues = client.get(f"/api/projects/{pid}").json()["issues"]
+        return sorted(i["rule"] for i in issues if not i["resolved"])
+
+    assert "cross_document_conflict" in open_rules()
+    assert client.post(f"/api/documents/{xlsx}/exclude", json={"reason": ""}).status_code == 422
+    assert client.post(f"/api/documents/{xlsx}/exclude", json={"reason": "Draft accounts"}).status_code == 200
+    assert "cross_document_conflict" not in open_rules()  # excluded docs take no part in validation
+    assert client.post(f"/api/documents/{xlsx}/exclude", json={"reason": "again"}).status_code == 409
+
+    # Excluded documents are read-only until restored.
+    field = client.get(f"/api/documents/{xlsx}").json()["fields"][0]
+    r = client.post(f"/api/fields/{field['id']}/review",
+                    json={"action": "approve", "expected_version": field["version"]})
+    assert r.status_code == 409
+    assert client.post(f"/api/documents/{xlsx}/approve-all").status_code == 409
+
+    assert client.post(f"/api/documents/{xlsx}/restore").status_code == 200
+    assert "cross_document_conflict" in open_rules()
+    assert client.post(f"/api/documents/{xlsx}/restore").status_code == 409
+
+
+def test_reprocessing_bumps_version_so_open_review_forms_go_stale(client, samples):
+    from app.pipeline import process_document
+
+    pid = client.post("/api/projects", json={"name": "P", "company_name": "Alpha"}).json()["id"]
+    doc = upload(client, pid, samples / "alpha_fs_2023.pdf")["document"]["id"]
+    drain()
+    before = {f["name"]: f for f in client.get(f"/api/documents/{doc}").json()["fields"]}
+    process_document(doc)  # e.g. a re-run after a prompt change
+    after = {f["name"]: f for f in client.get(f"/api/documents/{doc}").json()["fields"]}
+    assert after["revenue"]["version"] == before["revenue"]["version"] + 1
+    r = client.post(f"/api/fields/{before['revenue']['id']}/review",
+                    json={"action": "approve", "expected_version": before["revenue"]["version"]})
+    assert r.status_code == 409

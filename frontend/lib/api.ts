@@ -3,14 +3,42 @@ import * as C from "./contracts";
 
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
-export class ApiError extends Error {}
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number | null = null) {
+    super(message);
+  }
+
+  /** 409: the resource changed since it was loaded, or the action isn't allowed in its current state. */
+  get isConflict() {
+    return this.status === 409;
+  }
+}
+
+/** Human-readable message for any thrown value. */
+export function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+// FastAPI sends a string for HTTPException and a list of {loc, msg} for 422 validation errors.
+const ValidationDetail = z.array(z.object({ msg: z.string() }));
+
+function describeError(detail: unknown): string | null {
+  if (typeof detail === "string") return detail;
+  const parsed = ValidationDetail.safeParse(detail);
+  return parsed.success ? parsed.data.map((d) => d.msg.replace(/^Value error, /, "")).join("; ") : null;
+}
 
 async function request<T extends z.ZodType>(schema: T, path: string, init?: RequestInit): Promise<z.infer<T>> {
-  const res = await fetch(`${API_URL}${path}`, { cache: "no-store", ...init });
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}${path}`, { cache: "no-store", ...init });
+  } catch {
+    throw new ApiError("Cannot reach the API. Check that the backend is running.");
+  }
   const body = await res.json().catch(() => null);
   if (!res.ok) {
-    const detail = body && typeof body.detail === "string" ? body.detail : `HTTP ${res.status}`;
-    throw new ApiError(detail);
+    const detail = describeError(body?.detail) ?? `HTTP ${res.status}`;
+    throw new ApiError(detail, res.status);
   }
   const parsed = schema.safeParse(body);
   if (!parsed.success) {
@@ -40,6 +68,10 @@ export const api = {
   document: (id: string) => request(C.DocumentDetail, `/api/documents/${id}`),
   review: (fieldId: string, action: C.ReviewAction) =>
     request(C.ExtractedField, `/api/fields/${fieldId}/review`, json(C.ReviewAction.parse(action))),
+  exclude: (documentId: string, body: z.infer<typeof C.DocumentExclusion>) =>
+    request(C.Document, `/api/documents/${documentId}/exclude`, json(C.DocumentExclusion.parse(body))),
+  restore: (documentId: string) =>
+    request(C.Document, `/api/documents/${documentId}/restore`, { method: "POST" }),
   approveAll: (documentId: string) =>
     request(C.DocumentDetail, `/api/documents/${documentId}/approve-all`, { method: "POST" }),
   jobs: (status?: string) => request(z.array(C.Job), `/api/jobs${status ? `?status=${status}` : ""}`),

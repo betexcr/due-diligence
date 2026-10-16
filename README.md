@@ -39,11 +39,16 @@ cd backend && uv run uvicorn app.main:app --port 8000
 cd frontend && npm install && npm run dev
 ```
 
+The demo's simulated failures (see `SIMULATE_FAILURE:` in `samples/alpha_bank_confirmation.txt`) only
+fire with `DD_FAULT_INJECTION=1`. `.claude/launch.json` loads it from `backend/.env.development`; when
+starting uvicorn by hand, add `--env-file .env.development` after `uv run`. It is off by default,
+because it lets document content influence processing.
+
 Open http://localhost:3000. Without `ANTHROPIC_API_KEY` the backend uses a deterministic offline
 extractor (label matching), so the full workflow works with no network access. Set the key to use
 Claude (`claude-opus-4-8`, override with `DD_MODEL`). Force a mode with `DD_EXTRACTOR=claude|mock`.
 
-Tests: `cd backend && uv run pytest`
+Tests: `cd backend && uv run pytest`, and `cd frontend && npm test` (money parsing/formatting).
 
 ## Demo script (≈5 minutes)
 
@@ -61,8 +66,9 @@ Tests: `cd backend && uv run pytest`
 4. Open the 2024 review. The flagged value shows the page-2 quote and the PDF at that page.
    Correct it to 3,500,000 (a note is mandatory). Both issues disappear, because validation is
    recomputed from current values.
-5. *Approve clean values* on each document, then open the report: only approved figures,
-   corrections marked, sources cited, full audit trail.
+5. *Approve clean values* on each document. The report still says draft: the corrupt upload failed.
+   *Exclude* it with a reason on the project page; the report becomes ready, showing only approved
+   figures, corrections marked, sources cited, the exclusion and the full audit trail.
 6. **Pipeline ops** page: attempt history with the actual jittered delays, and DLQ requeue.
 
 ## Where each reliability concern lives
@@ -77,6 +83,10 @@ Tests: `cd backend && uv run pytest`
 | **Worker timeouts** | Each job runs in a child process killed after `DD_JOB_TIMEOUT` (Python can't kill a hung thread). `job_timeout < lease`, so a healthy worker finishes before anyone can steal its job ([worker.py](backend/app/worker.py)). |
 | **Structured I/O contracts** | Pydantic `FinancialExtraction` is the LLM output schema (`messages.parse`), re-validated in the pipeline; `extra="forbid"` rejects hallucinated keys. The UI parses every API response, and validates every request body, with Zod mirrors ([contracts.py](backend/app/contracts.py), [contracts.ts](frontend/lib/contracts.ts)). |
 | **LLM doesn't decide** | The model must return `null` instead of guessing, plus a verbatim quote and page/cell per value. All checks are deterministic code ([rules.py](backend/app/rules.py)). |
+| **Money** | Integer minor units (hundredths of the currency unit) in the database, rules and API; the LLM's printed numbers are converted once with `Decimal` ([money.py](backend/app/money.py), [money.ts](frontend/lib/money.ts)). |
+| **Concurrent review** | Every field has a `version`; reviews send the version they saw and the update is compare-and-set, so a stale form gets 409 instead of overwriting. Reprocessing bumps versions too. Review + revalidation commit in one transaction. |
+| **Schema evolution** | Numbered migrations tracked in `PRAGMA user_version`, each atomic with foreign-key checks; CHECK constraints guard statuses, confidence range and correction notes in the database itself ([db.py](backend/app/db.py)). |
+| **Prompt injection** | Document text is wrapped as untrusted data, closing delimiters inside it are neutralised, and the system prompt forbids following embedded instructions. The fixed output schema and deterministic checks limit the impact of anything that slips through. Prompt version and model id are stored with each extraction. |
 | **Human approval** | Report readiness requires: no open errors, every extracted value approved/corrected, no failed documents. Corrections require a note and are kept in an audit trail. |
 
 ## Prototype shortcuts → production path
@@ -87,7 +97,7 @@ Tests: `cd backend && uv run pytest`
 | Local disk storage | S3/GCS with object versioning; signed URLs for the source viewer |
 | Text-layer PDFs only | OCR route for scanned PDFs (Textract / Document Intelligence), or page images sent to Claude |
 | Hand-written Zod mirror of Pydantic | Generate Zod from the FastAPI OpenAPI schema in CI so the two can't drift |
-| No auth | SSO, per-project permissions, reviewer identity from the session |
+| No auth (reviewer is hard-coded `analyst`) | SSO, per-project permissions, reviewer identity from the session |
 | Fault injection via `SIMULATE_FAILURE:` marker | Remove, or gate behind a test flag (`DD_FAULT_INJECTION=0` disables it) |
 | No extraction accuracy metrics | Golden set of documents with known answers; track field-level precision/recall per model and prompt version |
 | Make / n8n not used | Orchestration triggers (email inbox, SharePoint drop, Slack notifications) are good no-code fits *around* this API; the retry/validation core stays in code |

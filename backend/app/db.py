@@ -1,6 +1,9 @@
 """SQLite persistence. One connection per unit of work; WAL lets the API and
 worker threads read while another thread writes.
 
+Schema changes are numbered migrations tracked in PRAGMA user_version; never
+edit a migration that has shipped, add a new one.
+
 The schema is deliberately relational (not a blob of LLM JSON) so the data
 contract between extraction, validation and reporting stays stable even if the
 prompt or model changes.
@@ -17,7 +20,7 @@ from typing import Iterator
 
 from .config import settings
 
-SCHEMA = """
+SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -135,6 +138,84 @@ CREATE TABLE IF NOT EXISTS reviews (
 """
 
 
+# Migration 2: money as integer minor units, optimistic concurrency, invariants
+# enforced in the database, model/prompt provenance, document exclusion.
+SCHEMA_V2 = """
+CREATE TABLE fields_v2 (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES documents(id),
+    name TEXT NOT NULL,
+    value_minor INTEGER,
+    original_value_minor INTEGER,
+    page INTEGER CHECK (page IS NULL OR page >= 1),
+    sheet TEXT,
+    cell TEXT,
+    quote TEXT,
+    confidence REAL NOT NULL CHECK (confidence BETWEEN 0 AND 1),
+    status TEXT NOT NULL CHECK (status IN ('extracted', 'flagged', 'missing', 'approved', 'corrected')),
+    version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE (document_id, name)
+);
+INSERT INTO fields_v2 (id, document_id, name, value_minor, original_value_minor, page, sheet, cell,
+                       quote, confidence, status, version)
+    SELECT id, document_id, name, CAST(ROUND(value * 100) AS INTEGER),
+           CAST(ROUND(original_value * 100) AS INTEGER), page, sheet, cell, quote,
+           MIN(MAX(confidence, 0), 1), status, 1
+    FROM fields;
+DROP TABLE fields;
+ALTER TABLE fields_v2 RENAME TO fields;
+
+CREATE TABLE validation_issues_v2 (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    document_id TEXT REFERENCES documents(id),
+    rule TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK (severity IN ('error', 'warning', 'info')),
+    message TEXT NOT NULL,
+    fields TEXT NOT NULL,
+    expected_minor INTEGER,
+    actual_minor INTEGER,
+    resolved INTEGER NOT NULL DEFAULT 0 CHECK (resolved IN (0, 1)),
+    created_at TEXT NOT NULL
+);
+INSERT INTO validation_issues_v2
+    SELECT id, project_id, document_id, rule, severity, message, fields,
+           CAST(ROUND(expected * 100) AS INTEGER), CAST(ROUND(actual * 100) AS INTEGER),
+           resolved, created_at
+    FROM validation_issues;
+DROP TABLE validation_issues;
+ALTER TABLE validation_issues_v2 RENAME TO validation_issues;
+CREATE INDEX validation_issues_project ON validation_issues (project_id, resolved);
+
+CREATE TABLE reviews_v2 (
+    id TEXT PRIMARY KEY,
+    field_id TEXT NOT NULL REFERENCES fields(id),
+    action TEXT NOT NULL CHECK (action IN ('approve', 'correct')),
+    old_value_minor INTEGER,
+    new_value_minor INTEGER,
+    note TEXT,
+    reviewer TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    CHECK (action = 'approve' OR (note IS NOT NULL AND length(trim(note)) > 0))
+);
+INSERT INTO reviews_v2
+    SELECT id, field_id, action, CAST(ROUND(old_value * 100) AS INTEGER),
+           CAST(ROUND(new_value * 100) AS INTEGER), note, reviewer, created_at
+    FROM reviews;
+DROP TABLE reviews;
+ALTER TABLE reviews_v2 RENAME TO reviews;
+
+ALTER TABLE extractions ADD COLUMN model TEXT;
+ALTER TABLE extractions ADD COLUMN prompt_version TEXT;
+
+ALTER TABLE documents ADD COLUMN excluded_at TEXT;
+ALTER TABLE documents ADD COLUMN excluded_reason TEXT;
+ALTER TABLE documents ADD COLUMN excluded_by TEXT;
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [(1, SCHEMA_V1), (2, SCHEMA_V2)]
+
+
 def now() -> datetime:
     return datetime.now(UTC)
 
@@ -182,4 +263,44 @@ def transaction() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)
     with connect() as conn:
-        conn.executescript(SCHEMA)
+        migrate(conn)
+
+
+def migrate(conn: sqlite3.Connection, target: int | None = None) -> int:
+    """Apply pending migrations in order; returns the resulting schema version.
+
+    Each migration runs in its own transaction together with its user_version
+    bump, so a failure leaves the database at the previous version. Foreign key
+    enforcement is suspended during a migration (SQLite's documented procedure
+    for table rebuilds) and checked before commit.
+    """
+    current = conn.execute("PRAGMA user_version").fetchone()[0]
+    for version, script in MIGRATIONS:
+        if version <= current or (target is not None and version > target):
+            continue
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for statement in _split_sql(script):
+                conn.execute(statement)
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise sqlite3.IntegrityError(f"Migration {version} broke foreign keys: {violations[:5]}")
+            conn.execute(f"PRAGMA user_version = {version}")
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
+        current = version
+    return current
+
+
+def _split_sql(script: str) -> list[str]:
+    # Our migration scripts contain no semicolons inside literals or triggers,
+    # so splitting on ';' is safe and lets every statement share one transaction
+    # (executescript would commit implicitly).
+    lines = [ln for ln in script.splitlines() if not ln.strip().startswith("--")]
+    return [s.strip() for s in "\n".join(lines).split(";") if s.strip()]

@@ -160,20 +160,20 @@ def fail(job: sqlite3.Row, worker_id: str, error: str, retryable: bool) -> str:
         return "dead"
 
 
-def requeue_dead(job_id: str) -> bool:
-    """Operator action: move a dead-lettered job back onto the queue with a fresh budget."""
-    with transaction() as conn:
-        row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
-        if row is None or row["status"] != JobStatus.dead:
-            return False
-        ts = iso()
-        conn.execute(
-            """UPDATE jobs SET status = ?, attempts = 0, next_run_at = ?, last_error = NULL,
-                   error_kind = NULL, updated_at = ? WHERE id = ?""",
-            (JobStatus.queued, ts, ts, job_id),
-        )
-        conn.execute(
-            "UPDATE dead_letters SET requeued_at = ? WHERE job_id = ? AND requeued_at IS NULL",
-            (ts, job_id),
-        )
-        return True
+def requeue_dead(conn: sqlite3.Connection, job_id: str) -> bool:
+    """Operator action: move a dead-lettered job back onto the queue with a fresh
+    budget. Runs in the caller's transaction so related state changes commit with it."""
+    row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if row is None or row["status"] != JobStatus.dead:
+        return False
+    ts = iso()
+    conn.execute(
+        """UPDATE jobs SET status = ?, attempts = 0, next_run_at = ?, last_error = NULL,
+               error_kind = NULL, updated_at = ? WHERE id = ?""",
+        (JobStatus.queued, ts, ts, job_id),
+    )
+    conn.execute(
+        "UPDATE dead_letters SET requeued_at = ? WHERE job_id = ? AND requeued_at IS NULL",
+        (ts, job_id),
+    )
+    return True

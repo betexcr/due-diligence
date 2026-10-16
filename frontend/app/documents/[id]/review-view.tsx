@@ -2,10 +2,15 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useState } from "react";
-import { api } from "@/lib/api";
+import { useId, useState } from "react";
+import { api, ApiError, errorMessage } from "@/lib/api";
 import { ReviewAction, type DocumentDetail, type ExtractedField, type ValidationIssue } from "@/lib/contracts";
-import { Badge, Button, ErrorNote, FIELD_LABELS, money, Panel, StatusBadge, usePolled } from "@/components/ui";
+import { formatMinor, minorToInput, parseMoneyToMinor } from "@/lib/money";
+import {
+  Badge, Button, ErrorNote, FIELD_LABELS, FOCUS_RING, INPUT_CLASS, Panel, StatusBadge, TableScroll, usePolled,
+} from "@/components/ui";
+
+const SOURCE_PANEL_ID = "source-evidence";
 
 export function ReviewView() {
   const { id } = useParams<{ id: string }>();
@@ -13,9 +18,11 @@ export function ReviewView() {
   const [selected, setSelected] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [announcement, setAnnouncement] = useState("");
 
-  if (!data) return error ? <ErrorNote error={error} /> : <p className="text-sm text-stone-500">Loading…</p>;
+  if (!data) return error ? <ErrorNote error={error} /> : <p className="text-sm text-stone-500" role="status">Loading…</p>;
   const { document: doc, fields, issues, reviews, currency } = data;
+  const readOnly = doc.excluded;
   const docIssues = issues.filter((i) => i.document_id === doc.id);
   const projectIssues = issues.filter((i) => i.document_id === null);
   const issuesFor = (name: string) => docIssues.filter((i) => i.fields.includes(name) && !i.resolved);
@@ -24,79 +31,105 @@ export function ReviewView() {
   const current = fields.find((f) => f.id === selected) ?? fields.find((f) => f.name === focus) ?? fields[0];
   const pending = fields.filter((f) => f.status === "extracted").length;
 
-  async function act(field: ExtractedField, action: ReviewAction) {
+  /** Runs a mutation with one in-flight guard, conflict recovery and announced feedback. */
+  async function run(action: () => Promise<unknown>, success: string): Promise<boolean> {
+    if (busy) return false;
     setBusy(true);
     setActionError(null);
     try {
-      await api.review(field.id, action);
+      await action();
+      setAnnouncement(success);
       await refresh();
+      return true;
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : String(e));
+      if (e instanceof ApiError && e.isConflict) {
+        // Someone else changed the data (or reprocessing ran): show the latest state.
+        await refresh();
+        setActionError(`${e.message} The latest values are now shown.`);
+      } else {
+        setActionError(errorMessage(e));
+      }
+      return false;
     } finally {
       setBusy(false);
     }
   }
 
-  async function approveClean() {
-    setBusy(true);
-    try {
-      await api.approveAll(doc.id);
-      await refresh();
-    } finally {
-      setBusy(false);
-    }
-  }
+  const label = (f: ExtractedField) => FIELD_LABELS[f.name] ?? f.name;
 
   return (
     <div className="space-y-5">
+      <p aria-live="polite" className="sr-only">{announcement}</p>
       <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
+        <div className="min-w-0">
           <p className="text-sm text-stone-500">
-            <Link href={`/projects/${doc.project_id}`} className="hover:underline">Project</Link> / review
+            <Link href={`/projects/${doc.project_id}`} className={`rounded hover:underline ${FOCUS_RING}`}>Project</Link> / review
           </p>
-          <h1 className="text-xl font-semibold tracking-tight">{doc.file_name}</h1>
+          <h1 className="break-words text-xl font-semibold tracking-tight">{doc.file_name}</h1>
           <p className="text-sm text-stone-600">
             {data.company_name ?? "Unknown company"} · FY{doc.fiscal_year ?? "?"} · {currency ?? "currency not stated"}
             {data.reporting_period_end && ` · period end ${data.reporting_period_end}`}
           </p>
         </div>
-        <div className="flex items-center gap-3">
-          <StatusBadge status={doc.status} />
-          <Button onClick={approveClean} disabled={busy || pending === 0}
-            title="Approve every value that passed all checks. Flagged values still need individual review.">
-            Approve {pending} clean value{pending === 1 ? "" : "s"}
-          </Button>
+        <div className="flex flex-wrap items-center gap-3">
+          {readOnly ? <Badge>excluded</Badge> : <StatusBadge status={doc.status} />}
+          {!readOnly && (
+            <Button onClick={() => run(() => api.approveAll(doc.id), `Approved ${pending} values.`)}
+              disabled={busy || pending === 0}
+              title="Approve every value that passed all checks. Flagged values still need individual review.">
+              {pending === 0 ? "No clean values to approve" : `Approve ${pending} clean value${pending === 1 ? "" : "s"}`}
+            </Button>
+          )}
         </div>
       </div>
 
-      <ErrorNote error={actionError} />
+      {readOnly && (
+        <div className="flex flex-wrap items-center gap-3 rounded-md border border-stone-300 bg-stone-100 px-4 py-3 text-sm">
+          <p className="flex-1">
+            Excluded from validation and the report: <q>{doc.excluded_reason}</q>. Values are read-only.
+          </p>
+          <Button onClick={() => run(() => api.restore(doc.id), "Document restored.")} disabled={busy}>
+            Restore document
+          </Button>
+        </div>
+      )}
 
-      {docIssues.filter((i) => !i.resolved).map((i) => <IssueCard key={i.id} issue={i} currency={currency} />)}
-      {projectIssues.filter((i) => !i.resolved).map((i) => <IssueCard key={i.id} issue={i} currency={currency} />)}
+      <ErrorNote error={actionError} onDismiss={() => setActionError(null)} />
 
-      <div className="grid gap-5 lg:grid-cols-[1.25fr_1fr]">
+      {!readOnly && docIssues.filter((i) => !i.resolved).map((i) => <IssueCard key={i.id} issue={i} currency={currency} />)}
+      {!readOnly && projectIssues.filter((i) => !i.resolved).map((i) => <IssueCard key={i.id} issue={i} currency={currency} />)}
+
+      <div className="grid gap-5 xl:grid-cols-[1.25fr_1fr]">
         <Panel title="Extracted values">
-          <table className="w-full text-sm">
-            <thead className="text-left text-xs uppercase tracking-wide text-stone-500">
-              <tr>
-                <th className="px-4 py-2 font-medium">Line item</th>
-                <th className="px-2 text-right font-medium">Value</th>
-                <th className="px-2 font-medium">Conf.</th>
-                <th className="px-2 font-medium">Status</th>
-                <th className="px-4 font-medium" />
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-stone-200">
-              {fields.map((f) => (
-                <FieldRow key={f.id} field={f} currency={currency} active={current?.id === f.id}
-                  issues={issuesFor(f.name)} busy={busy}
-                  onSelect={() => setSelected(f.id)} onAct={(a) => act(f, a)} />
-              ))}
-            </tbody>
-          </table>
+          {fields.length === 0 ? (
+            <p className="px-4 py-6 text-sm text-stone-500">Nothing was extracted from this document.</p>
+          ) : (
+            <TableScroll label="Extracted values">
+              <table className="w-full min-w-[560px] text-sm">
+                <thead className="text-left text-xs uppercase tracking-wide text-stone-500">
+                  <tr>
+                    <th scope="col" className="px-4 py-2 font-medium">Line item</th>
+                    <th scope="col" className="px-2 text-right font-medium">Value</th>
+                    <th scope="col" className="px-2 font-medium">Conf.</th>
+                    <th scope="col" className="px-2 font-medium">Status</th>
+                    <th scope="col" className="px-4 font-medium"><span className="sr-only">Actions</span></th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-stone-200">
+                  {fields.map((f) => (
+                    <FieldRow key={f.id} field={f} label={label(f)} currency={currency} active={current?.id === f.id}
+                      issues={issuesFor(f.name)} busy={busy} readOnly={readOnly}
+                      onSelect={() => setSelected(f.id)}
+                      onAct={(a) => run(() => api.review(f.id, a),
+                        `${label(f)} ${a.action === "correct" ? "corrected" : "approved"}.`)} />
+                  ))}
+                </tbody>
+              </table>
+            </TableScroll>
+          )}
         </Panel>
 
-        <div className="space-y-5">
+        <div className="min-w-0 space-y-5">
           <SourcePanel doc={doc} field={current} />
           <Panel title="Audit trail">
             <ul className="divide-y divide-stone-200 text-xs">
@@ -104,10 +137,11 @@ export function ReviewView() {
                 const f = fields.find((x) => x.id === r.field_id);
                 return (
                   <li key={r.id} className="px-4 py-2">
-                    <span className="text-stone-500">{new Date(r.created_at).toLocaleString()}</span>{" "}
-                    <b>{r.reviewer}</b> {r.action === "correct" ? "corrected" : "approved"}{" "}
-                    {FIELD_LABELS[f?.name ?? ""] ?? f?.name}
-                    {r.action === "correct" && <span className="num"> {money(r.old_value)} → {money(r.new_value)}</span>}
+                    <time dateTime={r.created_at} className="text-stone-500">{new Date(r.created_at).toLocaleString()}</time>{" "}
+                    <b>{r.reviewer}</b> {r.action === "correct" ? "corrected" : "approved"} {f ? label(f) : "a value"}
+                    {r.action === "correct" && (
+                      <span className="num"> {formatMinor(r.old_value_minor)} → {formatMinor(r.new_value_minor)}</span>
+                    )}
                     {r.note && <p className="mt-0.5 text-stone-600">“{r.note}”</p>}
                   </li>
                 );
@@ -123,93 +157,121 @@ export function ReviewView() {
 
 function IssueCard({ issue, currency }: { issue: ValidationIssue; currency: string | null }) {
   const border = issue.severity === "error" ? "border-rose-400 bg-rose-50" : "border-amber-400 bg-amber-50";
+  const { expected_minor: expected, actual_minor: actual } = issue;
   return (
-    <div className={`rounded-md border-l-4 px-4 py-3 text-sm ${border}`}>
-      <div className="flex items-center gap-2">
+    <section aria-label={`${issue.severity}: ${issue.rule}`} className={`rounded-md border-l-4 px-4 py-3 text-sm ${border}`}>
+      <div className="flex flex-wrap items-center gap-2">
         <StatusBadge status={issue.severity} />
         <code className="text-xs text-stone-600">{issue.rule}</code>
       </div>
       <p className="mt-1">{issue.message}</p>
-      {issue.expected !== null && issue.actual !== null && (
-        <dl className="num mt-2 grid w-fit grid-cols-2 gap-x-6 text-xs">
-          <dt className="text-stone-600">Extracted</dt><dd className="text-right">{money(issue.actual, currency)}</dd>
-          <dt className="text-stone-600">Calculated / other source</dt><dd className="text-right">{money(issue.expected, currency)}</dd>
-          <dt className="text-stone-600">Difference</dt><dd className="text-right">{money(issue.actual - issue.expected, currency)}</dd>
+      {expected !== null && actual !== null && (
+        <dl className="num mt-2 grid w-fit grid-cols-[auto_auto] gap-x-6 text-xs">
+          <dt className="text-stone-600">Extracted</dt><dd className="text-right">{formatMinor(actual, currency)}</dd>
+          <dt className="text-stone-600">Calculated / other source</dt><dd className="text-right">{formatMinor(expected, currency)}</dd>
+          <dt className="text-stone-600">Difference</dt><dd className="text-right">{formatMinor(actual - expected, currency)}</dd>
         </dl>
       )}
-    </div>
+    </section>
   );
 }
 
-function FieldRow({ field, currency, active, issues, busy, onSelect, onAct }: {
-  field: ExtractedField; currency: string | null; active: boolean; issues: ValidationIssue[]; busy: boolean;
-  onSelect: () => void; onAct: (a: ReviewAction) => void;
+function FieldRow({ field, label, currency, active, issues, busy, readOnly, onSelect, onAct }: {
+  field: ExtractedField; label: string; currency: string | null; active: boolean; issues: ValidationIssue[];
+  busy: boolean; readOnly: boolean; onSelect: () => void; onAct: (a: ReviewAction) => Promise<boolean>;
 }) {
   const [editing, setEditing] = useState(false);
-  const suggested = issues.find((i) => i.expected !== null)?.expected;
+  const suggested = issues.find((i) => i.expected_minor !== null)?.expected_minor ?? null;
   const [value, setValue] = useState("");
   const [note, setNote] = useState("");
   const [err, setErr] = useState<string | null>(null);
+  const ids = { value: useId(), note: useId(), err: useId(), hint: useId() };
   const reviewed = field.status === "approved" || field.status === "corrected";
 
   function startEdit() {
-    setValue(String(suggested ?? field.value ?? ""));
+    setValue(minorToInput(suggested ?? field.value_minor));
     setNote("");
     setErr(null);
     setEditing(true);
     onSelect();
   }
 
-  function submit() {
-    const parsed = ReviewAction.safeParse({ action: "correct", value: Number(value.replace(/[,\s]/g, "")), note });
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    const amount = parseMoneyToMinor(value);
+    if (!amount.ok) return setErr(amount.error);
+    const parsed = ReviewAction.safeParse({
+      action: "correct", value_minor: amount.minor, note, expected_version: field.version,
+    });
     if (!parsed.success) return setErr(parsed.error.issues[0].message);
-    onAct(parsed.data);
-    setEditing(false);
+    if (await onAct(parsed.data)) setEditing(false);
   }
 
   return (
     <>
-      <tr onClick={onSelect} className={`cursor-pointer align-top ${active ? "bg-stone-100" : "hover:bg-stone-50"}`}>
-        <td className="px-4 py-2.5">
-          <div className="font-medium">{FIELD_LABELS[field.name] ?? field.name}</div>
+      <tr className={`align-top ${active ? "bg-stone-100" : ""}`}>
+        <th scope="row" className="px-4 py-2 text-left font-normal">
+          <button type="button" onClick={onSelect} aria-pressed={active} aria-controls={SOURCE_PANEL_ID}
+            className={`rounded text-left font-medium hover:underline ${FOCUS_RING}`}
+            title="Show source evidence">
+            {label}
+          </button>
           {field.status === "corrected" && (
-            <div className="num text-xs text-stone-500">was {money(field.original_value)}</div>
+            <div className="num text-xs text-stone-500">was {formatMinor(field.original_value_minor)}</div>
           )}
-        </td>
+        </th>
         <td className={`num px-2 py-2.5 text-right ${field.status === "flagged" ? "text-rose-700" : ""}`}>
-          {money(field.value, currency)}
+          {formatMinor(field.value_minor, currency)}
         </td>
-        <td className="num px-2 py-2.5 text-xs text-stone-500">{field.value === null ? "—" : `${Math.round(field.confidence * 100)}%`}</td>
+        <td className="num px-2 py-2.5 text-xs text-stone-500">
+          {field.value_minor === null ? "—" : `${Math.round(field.confidence * 100)}%`}
+        </td>
         <td className="px-2 py-2.5"><StatusBadge status={field.status} /></td>
-        <td className="px-4 py-2 text-right whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
-          {!reviewed && (
+        <td className="whitespace-nowrap px-4 py-2 text-right">
+          {!readOnly && !reviewed && (
             <>
-              <Button variant="ghost" disabled={busy} onClick={() => onAct({ action: "approve" })}
-                title={field.value === null ? "Acknowledge that this item is not in the document" : "Value matches the source"}>
-                {field.value === null ? "Ack" : "Approve"}
+              <Button variant="ghost" disabled={busy}
+                onClick={() => onAct({ action: "approve", expected_version: field.version })}
+                aria-label={field.value_minor === null ? `Acknowledge ${label} is not in the document` : `Approve ${label}`}>
+                {field.value_minor === null ? "Ack" : "Approve"}
               </Button>
-              <Button variant="ghost" disabled={busy} onClick={startEdit}>Correct</Button>
+              <Button variant="ghost" disabled={busy} onClick={startEdit} aria-label={`Correct ${label}`}
+                aria-expanded={editing}>Correct</Button>
             </>
           )}
-          {reviewed && <Button variant="ghost" disabled={busy} onClick={startEdit}>Edit</Button>}
+          {!readOnly && reviewed && (
+            <Button variant="ghost" disabled={busy} onClick={startEdit} aria-label={`Edit ${label}`}
+              aria-expanded={editing}>Edit</Button>
+          )}
         </td>
       </tr>
       {editing && (
         <tr className="bg-stone-100">
           <td colSpan={5} className="px-4 pb-3">
-            <div className="flex flex-wrap items-start gap-2">
-              <input autoFocus value={value} onChange={(e) => setValue(e.target.value)} placeholder="Value"
-                className="num w-40 rounded border border-stone-300 bg-white px-2 py-1.5 text-right text-sm" />
-              <input value={note} onChange={(e) => setNote(e.target.value)}
-                placeholder="Why? e.g. typo in statement, confirmed against p.2 subtotals"
-                className="min-w-60 flex-1 rounded border border-stone-300 bg-white px-2 py-1.5 text-sm" />
-              <Button variant="primary" disabled={busy} onClick={submit}>Save correction</Button>
+            <form onSubmit={submit} onKeyDown={(e) => e.key === "Escape" && setEditing(false)}
+              className="flex flex-wrap items-start gap-2" aria-label={`Correct ${label}`}>
+              <div>
+                <label htmlFor={ids.value} className="sr-only">Corrected {label}{currency ? ` in ${currency}` : ""}</label>
+                <input id={ids.value} autoFocus inputMode="decimal" value={value} onChange={(e) => setValue(e.target.value)}
+                  aria-invalid={!!err} aria-describedby={`${err ? ids.err : ""} ${ids.hint}`.trim()}
+                  className={`num w-40 text-right ${INPUT_CLASS}`} placeholder="Amount" />
+              </div>
+              <div className="min-w-56 flex-1">
+                <label htmlFor={ids.note} className="sr-only">Reason for the correction</label>
+                <input id={ids.note} value={note} onChange={(e) => setNote(e.target.value)} maxLength={1000}
+                  placeholder="Why? e.g. typo in statement, confirmed against p.2 subtotals"
+                  aria-invalid={!!err} aria-describedby={err ? ids.err : undefined}
+                  className={`w-full ${INPUT_CLASS}`} />
+              </div>
+              <Button type="submit" variant="primary" disabled={busy}>{busy ? "Saving…" : "Save correction"}</Button>
               <Button variant="ghost" onClick={() => setEditing(false)}>Cancel</Button>
-            </div>
-            {suggested !== undefined && suggested !== null && (
-              <p className="mt-1 text-xs text-stone-500">Pre-filled with the calculated value. Verify it against the source before saving.</p>
-            )}
-            {err && <p className="mt-1 text-xs text-rose-700">{err}</p>}
+            </form>
+            <p id={ids.hint} className="mt-1 text-xs text-stone-500">
+              {suggested !== null
+                ? "Pre-filled with the calculated value. Verify it against the source before saving."
+                : "Enter the amount as printed, e.g. 3,500,000 or 1200.50."}
+            </p>
+            {err && <p id={ids.err} role="alert" className="mt-1 text-xs text-rose-700">{err}</p>}
           </td>
         </tr>
       )}
@@ -224,27 +286,31 @@ function SourcePanel({ doc, field }: { doc: DocumentDetail["document"]; field: E
         .filter(Boolean).join(", ")
     : "";
   return (
-    <Panel title="Source evidence" actions={
-      <a href={api.fileUrl(doc.id)} target="_blank" rel="noreferrer" className="text-xs underline">Open original</a>
-    }>
-      {field && (
-        <div className="border-b border-stone-200 px-4 py-3 text-sm">
-          <div className="flex items-center gap-2">
-            <b>{FIELD_LABELS[field.name] ?? field.name}</b>
-            {location && <Badge>{location}</Badge>}
+    <div id={SOURCE_PANEL_ID}>
+      <Panel title="Source evidence" actions={
+        <a href={api.fileUrl(doc.id)} target="_blank" rel="noreferrer" className={`rounded text-xs underline ${FOCUS_RING}`}>
+          Open original<span className="sr-only"> (opens in a new tab)</span>
+        </a>
+      }>
+        {field && (
+          <div className="border-b border-stone-200 px-4 py-3 text-sm" aria-live="polite">
+            <div className="flex flex-wrap items-center gap-2">
+              <b>{FIELD_LABELS[field.name] ?? field.name}</b>
+              {location && <Badge>{location}</Badge>}
+            </div>
+            {field.quote ? (
+              <blockquote className="num mt-2 break-words rounded bg-amber-50 px-3 py-2 text-xs ring-1 ring-amber-200">{field.quote}</blockquote>
+            ) : (
+              <p className="mt-2 text-xs text-stone-500">The extractor found no reliable evidence for this item, so it was left empty rather than guessed.</p>
+            )}
           </div>
-          {field.quote ? (
-            <blockquote className="num mt-2 rounded bg-amber-50 px-3 py-2 text-xs ring-1 ring-amber-200">{field.quote}</blockquote>
-          ) : (
-            <p className="mt-2 text-xs text-stone-500">The extractor found no reliable evidence for this item, so it was left empty rather than guessed.</p>
-          )}
-        </div>
-      )}
-      {isPdf && (
-        <iframe key={`${doc.id}-${field?.page ?? 1}`} title="Source document"
-          src={`${api.fileUrl(doc.id)}#page=${field?.page ?? 1}&view=FitH`}
-          className="h-[520px] w-full rounded-b-md" />
-      )}
-    </Panel>
+        )}
+        {isPdf && (
+          <iframe key={`${doc.id}-${field?.page ?? 1}`} title={`${doc.file_name}, page ${field?.page ?? 1}`}
+            src={`${api.fileUrl(doc.id)}#page=${field?.page ?? 1}&view=FitH`}
+            className="h-[420px] w-full rounded-b-md lg:h-[520px]" />
+        )}
+      </Panel>
+    </div>
   );
 }

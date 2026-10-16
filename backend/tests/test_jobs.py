@@ -68,7 +68,8 @@ def test_permanent_failure_skips_retries():
     assert jobs.fail(job, "w1", "corrupt pdf", retryable=False) == "dead"
     with connect() as conn:
         assert conn.execute("SELECT reason FROM dead_letters").fetchone()["reason"] == "permanent_error"
-    assert jobs.requeue_dead(up.job_id)
+    with transaction() as conn:
+        assert jobs.requeue_dead(conn, up.job_id)
     row = _job(up.job_id)
     assert row["status"] == "queued" and row["attempts"] == 0
 

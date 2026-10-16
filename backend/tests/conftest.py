@@ -16,6 +16,7 @@ SAMPLES = Path(__file__).resolve().parent.parent.parent / "samples"
 def fresh_db(tmp_path, monkeypatch):
     # Env var too, so spawned worker processes see the same database.
     monkeypatch.setenv("DD_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DD_FAULT_INJECTION", "1")  # samples use SIMULATE_FAILURE markers
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     monkeypatch.setattr(settings, "extractor", "mock")
     monkeypatch.setattr(settings, "backoff_base_seconds", 0.0)  # retries are due immediately

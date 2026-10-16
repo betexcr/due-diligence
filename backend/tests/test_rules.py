@@ -9,7 +9,9 @@ BASE = {
 
 
 def facts(doc_id="d1", year=2024, currency="USD", company="Alpha Manufacturing Inc.", **overrides):
-    return DocFacts(doc_id, f"{doc_id}.pdf", company, year, currency, {**BASE, **overrides})
+    # Figures are written in whole currency units for readability; rules work in minor units.
+    values = {k: (v * 100 if v is not None else None) for k, v in {**BASE, **overrides}.items()}
+    return DocFacts(doc_id, f"{doc_id}.pdf", company, year, currency, values)
 
 
 def rules(issues):
@@ -23,7 +25,7 @@ def test_consistent_statement_has_no_issues():
 def test_operating_income_mismatch_is_flagged_with_expected_value():
     [issue] = validate_document(facts(operating_income=4_500_000))
     assert issue.rule == "operating_income_identity"
-    assert issue.expected == 3_500_000 and issue.actual == 4_500_000
+    assert issue.expected == 3_500_000_00 and issue.actual == 4_500_000_00
     assert "operating_income" in issue.fields
 
 
@@ -73,3 +75,16 @@ def test_currency_and_company_mismatch():
 def test_revenue_swing_warning():
     issues = validate_project("Alpha", [facts("a", year=2023, revenue=5_000_000), facts("b")])
     assert "revenue_swing" in rules(issues)
+
+
+def test_tolerance_floor_is_one_currency_unit():
+    # A 1-unit rounding difference on small figures is not a finding; 2 units is.
+    small = dict(revenue=100, cost_of_goods_sold=40, gross_profit=60, operating_expenses=20, net_income=30,
+                 total_assets=None, total_liabilities=None, total_equity=None, total_debt=None, cash=None)
+    assert validate_document(facts(**small, operating_income=41)) == []
+    assert rules(validate_document(facts(**small, operating_income=42))) == ["operating_income_identity"]
+
+
+def test_message_formats_minor_units_as_currency():
+    [issue] = validate_document(facts(operating_income=4_500_000))
+    assert "4,500,000" in issue.message and "3,500,000" in issue.message

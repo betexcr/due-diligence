@@ -1,6 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { FOCUS_RING, INPUT_CLASS } from "@/lib/styles";
+
+export { FOCUS_RING, INPUT_CLASS };
 
 export const FIELD_LABELS: Record<string, string> = {
   revenue: "Revenue",
@@ -15,12 +18,6 @@ export const FIELD_LABELS: Record<string, string> = {
   total_debt: "Total debt",
   cash: "Cash",
 };
-
-export function money(v: number | null | undefined, currency?: string | null) {
-  if (v === null || v === undefined) return "—";
-  const s = Math.abs(v).toLocaleString("en-US", { maximumFractionDigits: 0 });
-  return `${currency ? currency + " " : ""}${v < 0 ? `(${s})` : s}`;
-}
 
 /** When a queued retry will run: "in 12s", or "due now" once its backoff has elapsed. */
 export function retryIn(iso: string) {
@@ -80,11 +77,13 @@ export function StatusBadge({ status }: { status: string }) {
 export function Panel({ title, actions, children, className = "" }: {
   title?: React.ReactNode; actions?: React.ReactNode; children: React.ReactNode; className?: string;
 }) {
+  const headingId = useId();
   return (
-    <section className={`rounded-md border border-stone-300 bg-white ${className}`}>
+    <section aria-labelledby={title ? headingId : undefined}
+      className={`min-w-0 rounded-md border border-stone-300 bg-white ${className}`}>
       {title && (
-        <header className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-2.5">
-          <h2 className="text-[13px] font-semibold uppercase tracking-wider text-stone-600">{title}</h2>
+        <header className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 px-4 py-2.5">
+          <h2 id={headingId} className="text-[13px] font-semibold uppercase tracking-wider text-stone-600">{title}</h2>
           {actions}
         </header>
       )}
@@ -101,12 +100,31 @@ export function Button({ variant = "secondary", className = "", ...props }:
     danger: "bg-rose-700 text-white hover:bg-rose-600",
     ghost: "text-stone-700 hover:bg-stone-100",
   }[variant];
-  return <button {...props} className={`rounded px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed ${styles} ${className}`} />;
+  return <button type="button" {...props} className={`rounded px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed ${FOCUS_RING} ${styles} ${className}`} />;
 }
 
-export function ErrorNote({ error }: { error: string | null }) {
+
+export function ErrorNote({ error, onDismiss }: { error: string | null; onDismiss?: () => void }) {
   if (!error) return null;
-  return <p className="rounded border border-rose-300 bg-rose-50 px-3 py-2 text-sm text-rose-800">{error}</p>;
+  return (
+    <div role="alert" className="flex items-start gap-3 rounded border border-rose-300 bg-rose-50 px-3 py-2 text-sm text-rose-800">
+      <p className="flex-1">{error}</p>
+      {onDismiss && (
+        <button type="button" onClick={onDismiss} className={`rounded px-1 text-rose-700 hover:bg-rose-100 ${FOCUS_RING}`}
+          aria-label="Dismiss error">×</button>
+      )}
+    </div>
+  );
+}
+
+/** Wraps wide tables so they scroll inside their panel on narrow screens instead of the page. */
+export function TableScroll({ children, label }: { children: React.ReactNode; label: string }) {
+  return (
+    // tabIndex lets keyboard users scroll the region; role/label make it announceable.
+    <div role="region" aria-label={label} tabIndex={0} className={`overflow-x-auto ${FOCUS_RING}`}>
+      {children}
+    </div>
+  );
 }
 
 /** Fetch and re-poll while `shouldPoll(data)` is true. */

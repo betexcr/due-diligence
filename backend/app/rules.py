@@ -10,9 +10,11 @@ in one place.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 from .config import settings
 from .contracts import Severity
+from .money import MINOR_PER_UNIT, format_minor
 
 REQUIRED_BY_STATEMENT = {
     "income_statement": ["revenue", "operating_income", "net_income"],
@@ -27,7 +29,7 @@ class DocFacts:
     company_name: str | None
     fiscal_year: int | None
     currency: str | None
-    values: dict[str, float | None]
+    values: dict[str, int | None]  # integer minor units
     confidence: dict[str, float] = field(default_factory=dict)
 
 
@@ -38,18 +40,20 @@ class Issue:
     message: str
     fields: list[str]
     document_id: str | None = None
-    expected: float | None = None
-    actual: float | None = None
+    expected: int | None = None  # minor units
+    actual: int | None = None
 
 
-def _close(expected: float, actual: float, tolerance_pct: float | None = None) -> bool:
-    tol = settings.tolerance_pct if tolerance_pct is None else tolerance_pct
-    allowed = max(1.0, abs(tol) / 100 * max(abs(expected), abs(actual)))
+def _close(expected: int, actual: int, tolerance_pct: float | None = None) -> bool:
+    """Within tolerance_pct of the larger magnitude, and never stricter than one
+    whole currency unit (statements round to units)."""
+    tol = Decimal(str(settings.tolerance_pct if tolerance_pct is None else tolerance_pct))
+    allowed = max(Decimal(MINOR_PER_UNIT), abs(tol) / 100 * max(abs(expected), abs(actual)))
     return abs(expected - actual) <= allowed
 
 
-def _fmt(x: float) -> str:
-    return f"{x:,.0f}"
+def _fmt(x: int) -> str:
+    return format_minor(x)
 
 
 def validate_document(d: DocFacts) -> list[Issue]:
