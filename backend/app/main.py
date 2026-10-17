@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from . import jobs
 from .config import settings
@@ -52,6 +53,24 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Due Diligence Extraction API", version="0.1.0", lifespan=lifespan)
+
+PUBLIC_PATHS = {"/api/health"}
+
+
+# Registered before CORSMiddleware so CORS wraps it: preflights are answered without a token and 401s
+# still carry CORS headers.
+@app.middleware("http")
+async def require_api_token(request: Request, call_next):
+    token = settings.api_token
+    if token is None or request.url.path in PUBLIC_PATHS:
+        return await call_next(request)
+    scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(supplied.encode(), token.encode()):
+        return JSONResponse({"detail": "Missing or invalid API token"}, status_code=401,
+                            headers={"WWW-Authenticate": "Bearer"})
+    return await call_next(request)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get("DD_CORS_ORIGINS", "http://localhost:3000").split(","),

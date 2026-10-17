@@ -1,7 +1,8 @@
 import { z } from "zod";
 import * as C from "./contracts";
 
-export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+// Paths are same-origin: app/api/[...path]/route.ts forwards them to the backend and adds its token, so
+// the token never reaches the browser and file/report links need no Authorization header.
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number | null = null) {
@@ -31,7 +32,7 @@ function describeError(detail: unknown): string | null {
 async function request<T extends z.ZodType>(schema: T, path: string, init?: RequestInit): Promise<z.infer<T>> {
   let res: Response;
   try {
-    res = await fetch(`${API_URL}${path}`, { cache: "no-store", ...init });
+    res = await fetch(path, { cache: "no-store", ...init });
   } catch {
     throw new ApiError("Cannot reach the API. Check that the backend is running.");
   }
@@ -77,6 +78,6 @@ export const api = {
   jobs: (status?: string) => request(z.array(C.Job), `/api/jobs${status ? `?status=${status}` : ""}`),
   attempts: (jobId: string) => request(z.array(C.JobAttempt), `/api/jobs/${jobId}/attempts`),
   requeue: (jobId: string) => request(C.Job, `/api/jobs/${jobId}/requeue`, { method: "POST" }),
-  fileUrl: (documentId: string) => `${API_URL}/api/documents/${documentId}/file`,
-  reportUrl: (projectId: string) => `${API_URL}/api/projects/${projectId}/report.html`,
+  fileUrl: (documentId: string) => `/api/documents/${documentId}/file`,
+  reportUrl: (projectId: string) => `/api/projects/${projectId}/report.html`,
 };

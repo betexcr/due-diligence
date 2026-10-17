@@ -46,6 +46,10 @@ cd backend && uv run --env-file .env uvicorn app.main:app --port 8000
 cd frontend && npm install && npm run dev
 ```
 
+The frontend proxies `/api/*` to the backend from its server. To use a hosted backend, create
+`frontend/.env.local` (gitignored) with `API_URL=<backend URL>` and `DD_API_TOKEN=<the backend's token>`;
+see [backend/README.md](backend/README.md#authentication).
+
 The demo's simulated failures (see `SIMULATE_FAILURE:` in `samples/alpha_bank_confirmation.txt`) only
 fire with `DD_FAULT_INJECTION=1`. `.claude/launch.json` loads it from `backend/.env.development`; when
 starting uvicorn by hand, add `--env-file .env.development` before `--env-file .env`. It is off by default,

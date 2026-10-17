@@ -1,0 +1,8 @@
+# Never upload local secrets, environments or data to Railway.
+.env
+.env.*
+!env.example
+.venv/
+data/
+.pytest_cache/
+__pycache__/

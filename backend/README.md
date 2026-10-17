@@ -59,7 +59,23 @@ On startup the app creates or migrates the SQLite database, re-runs validation o
 starts the worker pool in the same process. Data lives in `data/` (`dd.sqlite3` and uploaded files
 under `files/`); delete that directory to start from an empty database.
 
-The frontend expects the API at `http://localhost:8000`; CORS allows `http://localhost:3000` by default.
+The frontend reaches the API through its own `/api/*` route handler, which forwards to `API_URL`
+(default `http://localhost:8000`) server-side; the browser never calls the API directly.
+
+## Authentication
+
+Locally, with `DD_API_TOKEN` unset, the API is open. Anywhere the API is reachable from the internet,
+set `DD_API_TOKEN` (at least 32 characters) and `DD_REQUIRE_API_TOKEN=1`. Every route except
+`/api/health` then needs `Authorization: Bearer <token>`, and the app refuses to start if the token is
+missing. The frontend sends the token from its server-side `DD_API_TOKEN`, so it never reaches the
+browser. This is a single shared secret for a demo deployment, not user authentication.
+
+## Deploying to Railway
+
+`railway.json` sets the start command and health check; `.railwayignore` keeps `.env`, `.venv` and
+`data/` out of uploads. The service needs a volume mounted at `/data` and these variables:
+`DD_DATA_DIR=/data`, `DD_REQUIRE_API_TOKEN=1`, `DD_API_TOKEN`, and, for Claude extraction,
+`DD_EXTRACTOR=claude` and `ANTHROPIC_API_KEY`. SQLite and the in-process workers mean one replica only.
 
 ## Configuration
 
@@ -72,6 +88,8 @@ All settings are environment variables with defaults; see `app/config.py`.
 | `DD_MODEL` | `claude-opus-4-8` | Model used by the Claude extractor. |
 | `DD_DATA_DIR` | `backend/data` | Database and file storage location. |
 | `DD_CORS_ORIGINS` | `http://localhost:3000` | Comma-separated allowed origins. |
+| `DD_API_TOKEN` | unset | Shared bearer token required on all routes but `/api/health`. Secret; min. 32 characters. |
+| `DD_REQUIRE_API_TOKEN` | `0` | `1` refuses to start without `DD_API_TOKEN`. Set it on every hosted deployment. |
 | `DD_FAULT_INJECTION` | `0` | `1` honours `SIMULATE_FAILURE:` markers. Demo only: it lets document content affect processing. |
 | `DD_START_WORKERS` | `1` | `0` runs the API without the worker pool (jobs queue up but do not run). |
 | `DD_WORKERS` | `2` | Worker threads. |

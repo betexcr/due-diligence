@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+MIN_TOKEN_LENGTH = 32
 
 
 def _env_int(name: str, default: int) -> int:
@@ -38,6 +39,19 @@ class Settings:
     # Business validation
     tolerance_pct: float = field(default_factory=lambda: _env_float("DD_TOLERANCE_PCT", 0.5))
     min_confidence: float = field(default_factory=lambda: _env_float("DD_MIN_CONFIDENCE", 0.7))
+
+    # Shared bearer token required on every route except /api/health. Unset leaves the API open, which is
+    # only acceptable on localhost; set it wherever the API is reachable from the internet.
+    api_token: str | None = field(default_factory=lambda: os.environ.get("DD_API_TOKEN", "").strip() or None)
+
+    # Set on any internet-facing deployment, so a forgotten DD_API_TOKEN stops startup instead of serving openly.
+    require_api_token: bool = field(default_factory=lambda: os.environ.get("DD_REQUIRE_API_TOKEN", "0") == "1")
+
+    def __post_init__(self) -> None:
+        if self.require_api_token and self.api_token is None:
+            raise ValueError("DD_REQUIRE_API_TOKEN=1 but DD_API_TOKEN is not set")
+        if self.api_token is not None and len(self.api_token) < MIN_TOKEN_LENGTH:
+            raise ValueError(f"DD_API_TOKEN must be at least {MIN_TOKEN_LENGTH} characters")
 
     @property
     def db_path(self) -> Path:
