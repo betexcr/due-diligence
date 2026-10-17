@@ -39,7 +39,7 @@ cd backend && cp env.example .env
 extractor). `.claude/launch.json` loads it, and uv refuses to start if the file is missing.
 
 ```bash
-cd backend && uv run uvicorn app.main:app --port 8000
+cd backend && uv run --env-file .env uvicorn app.main:app --port 8000
 ```
 
 ```bash
@@ -48,12 +48,14 @@ cd frontend && npm install && npm run dev
 
 The demo's simulated failures (see `SIMULATE_FAILURE:` in `samples/alpha_bank_confirmation.txt`) only
 fire with `DD_FAULT_INJECTION=1`. `.claude/launch.json` loads it from `backend/.env.development`; when
-starting uvicorn by hand, add `--env-file .env.development` after `uv run`. It is off by default,
+starting uvicorn by hand, add `--env-file .env.development` before `--env-file .env`. It is off by default,
 because it lets document content influence processing.
 
 Open http://localhost:3000. Without `ANTHROPIC_API_KEY` the backend uses a deterministic offline
 extractor (label matching), so the full workflow works with no network access. Set the key to use
 Claude (`claude-opus-4-8`, override with `DD_MODEL`). Force a mode with `DD_EXTRACTOR=claude|mock`.
+
+Backend configuration, environment variables and layout: [backend/README.md](backend/README.md).
 
 Tests: `cd backend && uv run pytest`, and `cd frontend && npm test` (money parsing/formatting).
 
